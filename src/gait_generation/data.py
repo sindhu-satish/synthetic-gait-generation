@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 from .preprocessor import Preprocessor
 from .config import (
     RARE_THRESH, TEST_SIZE, VAL_SIZE, SEED, WINDOW_SIZE, WINDOW_STRIDE,
-    VAE_BATCH_SIZE, NUM_WORKERS, COND_COLS
+    VAE_BATCH_SIZE, NUM_WORKERS, COND_COLS, PIN_MEMORY
 )
 
 def load_sensor_csvs(gait_base_dir: str, sensor_type: str):
@@ -168,11 +168,29 @@ class GaitDataModule(pl.LightningDataModule):
         self.test_ds = WindowedGaitDataset(test_windows, test_cond_idx)
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=VAE_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    
+        return DataLoader(
+            self.train_ds,
+            batch_size=VAE_BATCH_SIZE,
+            shuffle=True,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+        )
+
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=VAE_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+        return DataLoader(
+            self.val_ds,
+            batch_size=VAE_BATCH_SIZE,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+        )
     
     def test_dataloader(self):
-        return DataLoader(self.test_ds, batch_size=VAE_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+        return DataLoader(
+            self.test_ds,
+            batch_size=VAE_BATCH_SIZE,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+        )
 

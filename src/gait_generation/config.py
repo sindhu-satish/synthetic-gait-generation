@@ -21,25 +21,25 @@ COND_COLS = ()
 WINDOW_SIZE = 128
 WINDOW_STRIDE = 64
 
-LATENT_DIM = 64
+LATENT_DIM = 128
 HIDDEN_DIM = 1024
 N_LAYERS = 4
 CAT_EMBED_DIM = 16
-DROPOUT = 0.0
+DROPOUT = 0.05
 
 VAE_EPOCHS = 50
 VAE_BATCH_SIZE = 256
 VAE_LR = 1e-3
-KL_MAX_BETA = 0.25
+KL_MAX_BETA = 1.0
 KL_WARMUP_EPOCHS = 20
 VAE_PATIENCE = 8
-KL_BETA = 0.5
+KL_BETA = 1.0
 
 USE_SMOOTHNESS_LOSS = True
 USE_DISTRIBUTION_LOSS = True
 LAMBDA_SMOOTH = 1e-3
 LAMBDA_PHYS = 5e-3
-LAMBDA_SPECTRAL = 5e-2
+LAMBDA_SPECTRAL = 1e-2
 
 T = 400
 BETA_SCHEDULE = "cosine"
@@ -58,5 +58,13 @@ OUT_CSV_PREFIX = "synth_gait"
 
 SEED = 42
 SAVE_DIR = "checkpoints/gait"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
+PIN_MEMORY = (DEVICE == "cuda")
 

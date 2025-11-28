@@ -12,7 +12,7 @@ from .config import (
     VAE_LR, VAE_EPOCHS, VAE_PATIENCE, KL_MAX_BETA, KL_WARMUP_EPOCHS, KL_BETA,
     USE_SMOOTHNESS_LOSS, USE_DISTRIBUTION_LOSS, LAMBDA_SMOOTH, LAMBDA_PHYS, LAMBDA_SPECTRAL,
     DEVICE, DDPM_LR, DDPM_EPOCHS, DDPM_PATIENCE, DDPM_BATCH_SIZE, T, BETA_SCHEDULE,
-    NUM_WORKERS, DDPM_USE_MU_ONLY, DDPM_USE_EMA, DDPM_EMA_DECAY
+    NUM_WORKERS, DDPM_USE_MU_ONLY, DDPM_USE_EMA, DDPM_EMA_DECAY, PIN_MEMORY
 )
 from .physics_losses import smoothness_loss, distribution_loss, spectral_loss
 
@@ -176,8 +176,20 @@ def train_ddpm(model, Z_train, C_train, Z_val, C_val, save_dir: str, sensor_type
     
     train_ds = LatentDataset(Z_train, C_train)
     val_ds = LatentDataset(Z_val, C_val)
-    train_loader = DataLoader(train_ds, batch_size=DDPM_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=DDPM_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=DDPM_BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=DDPM_BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+    )
 
     best_val = float("inf")
     patience = DDPM_PATIENCE
