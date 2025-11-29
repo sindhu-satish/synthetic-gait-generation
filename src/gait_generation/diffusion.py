@@ -75,33 +75,37 @@ class UNetMLP(nn.Module):
             h = block(h, cond_emb=cond_block_emb)
         return self.out(h)
 
-class LatentDDPM:
+class LatentDDPM(nn.Module):
     def __init__(self, model: UNetMLP, T=400, beta_schedule="cosine", device="cpu"):
+        super().__init__()
         self.model = model
-        self.T = T
-        self.device = device
-        
+        self.device = torch.device(device)
+        self.num_timesteps = T
         if beta_schedule == "linear":
-            betas = torch.linspace(1e-4, 0.02, T, device=device)
+            betas = torch.linspace(1e-4, 0.02, T, device=self.device)
         elif beta_schedule == "cosine":
             steps = T + 1
             s = 0.008
-            x = torch.linspace(0, T, steps, device=device)
-            alphas_cumprod = torch.cos(((x/T + s) / (1+s)) * math.pi/2)**2
+            x = torch.linspace(0, T, steps, device=self.device)
+            alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi / 2) ** 2
             alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
             betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            betas = torch.clamp(betas, 1e-5, 0.999)
+            betas = betas.clamp(0.0001, 0.9999)
         else:
             raise ValueError("unknown beta schedule")
         
-        self.betas = betas
-        self.alphas = 1.0 - betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = torch.cat([torch.tensor([1.0], device=device), self.alphas_cumprod[:-1]], dim=0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0/self.alphas)
-        self.posterior_variance = betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", 1.0 - betas)
+        self.register_buffer("alphas_cumprod", torch.cumprod(1.0 - betas, dim=0))
+        self.register_buffer("alphas_cumprod_prev", torch.cat(
+            [torch.tensor([1.0], device=self.device), self.alphas_cumprod[:-1]], dim=0
+        ))
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(self.alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - self.alphas_cumprod))
+        self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0/self.alphas))
+        self.register_buffer("posterior_variance",
+            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
 
     def q_sample(self, x0, t, noise=None):
         if noise is None:
@@ -126,7 +130,7 @@ class LatentDDPM:
 
     @torch.no_grad()
     def sample(self, n, cond_idx=None, steps=None):
-        steps = steps or self.T
+        steps = steps or self.num_timesteps
         model = self.model
         model.eval()
         x = torch.randn(n, model.out.out_features, device=self.device)
