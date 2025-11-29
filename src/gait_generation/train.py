@@ -226,15 +226,18 @@ def train_ddpm(
             
             mse_loss = F.mse_loss(noise_pred, noise)
             
-            sqrt_ac = ddpm.sqrt_alphas_cumprod[t][:, None]
-            sqrt_om = ddpm.sqrt_one_minus_alphas_cumprod[t][:, None]
-            recon_x0 = (zt - sqrt_om * noise_pred) / (sqrt_ac + 1e-8)
-            
-            
+            t0 = torch.zeros_like(t)
+            noise0 = torch.randn_like(z0)
+            zt0 = ddpm.q_sample(z0, t0, noise0)
+            noise_pred0 = model(zt0, t0, cond)
+            sqrt_ac0 = ddpm.sqrt_alphas_cumprod[t0][:, None]
+            sqrt_om0 = ddpm.sqrt_one_minus_alphas_cumprod[t0][:, None]
+            recon_x0_0 = (zt0 - sqrt_om0 * noise_pred0) / (sqrt_ac0 + 1e-8)
+
             real_var = z0.var(dim=0, unbiased=False)
-            synthetic_var = recon_x0.var(dim=0, unbiased=False)
-            denom = real_var.detach().mean().clamp_min(1e-8)
-            var_loss = F.mse_loss(synthetic_var, real_var) / denom
+            synthetic_var = recon_x0_0.var(dim=0, unbiased=False)
+            eps = 1e-8
+            var_loss = F.mse_loss(torch.log(synthetic_var + eps), torch.log(real_var + eps))
             
             loss = mse_loss + LAMBDA_VAR * var_loss
             
@@ -271,14 +274,19 @@ def train_ddpm(
                 noise_pred = model(zt, t, cond)
                 mse = F.mse_loss(noise_pred, noise)
 
-                sqrt_ac = ddpm.sqrt_alphas_cumprod[t][:, None]
-                sqrt_om = ddpm.sqrt_one_minus_alphas_cumprod[t][:, None]
-                recon_x0 = (zt - sqrt_om * noise_pred) / (sqrt_ac + 1e-8)
+
+                t0 = torch.zeros_like(t)
+                noise0 = torch.randn_like(z0)
+                zt0 = ddpm.q_sample(z0, t0, noise0)
+                noise_pred0 = model(zt0, t0, cond)
+                sqrt_ac0 = ddpm.sqrt_alphas_cumprod[t0][:, None]
+                sqrt_om0 = ddpm.sqrt_one_minus_alphas_cumprod[t0][:, None]
+                recon_x0_0 = (zt0 - sqrt_om0 * noise_pred0) / (sqrt_ac0 + 1e-8)
 
                 real_var = z0.var(dim=0, unbiased=False)
-                synthetic_var = recon_x0.var(dim=0, unbiased=False)
-                denom = real_var.detach().mean().clamp_min(1e-8)
-                var = F.mse_loss(synthetic_var, real_var) / denom
+                synthetic_var = recon_x0_0.var(dim=0, unbiased=False)
+                eps = 1e-8
+                var = F.mse_loss(torch.log(synthetic_var + eps), torch.log(real_var + eps))
 
                 total = mse + LAMBDA_VAR * var
                 v_total.append(total.item())
