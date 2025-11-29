@@ -24,8 +24,9 @@ def sample_synthetic(n: int, ddpm: LatentDDPM, vae: WindowVAE, dm: GaitDataModul
             probs = np.ones(len(unique_conds)) / len(unique_conds)
             cond_idx = np.random.choice(unique_conds, size=n, p=probs)
     
-    Z = ddpm.sample(n=n, cond_idx=cond_idx, steps=steps)
-    Z = Z.to(DEVICE)
+    Z = ddpm.sample(n=n, cond_idx=cond_idx, steps=steps).to(DEVICE)
+    if hasattr(ddpm, "z_mean") and hasattr(ddpm, "z_std") and ddpm.z_mean is not None and ddpm.z_std is not None:
+        Z = Z * ddpm.z_std + ddpm.z_mean
     
     recon_flat = vae.decode(Z)
     recon_windows = recon_flat.view(n, WINDOW_SIZE, 3)

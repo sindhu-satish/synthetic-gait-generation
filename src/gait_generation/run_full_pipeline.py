@@ -55,6 +55,13 @@ def train_ddpm_model(sensor_type: str, vae, dm, save_dir: str):
     
     Z_train, C_train = encode_dataset_to_latents(dm.train_ds, vae)
     Z_val, C_val = encode_dataset_to_latents(dm.val_ds, vae)
+
+
+    z_mean = Z_train.mean(axis=0)
+    z_std = Z_train.std(axis=0)
+    z_std = np.maximum(z_std, 1e-6)
+    Z_train = (Z_train - z_mean) / z_std
+    Z_val = (Z_val - z_mean) / z_std
     
     unet = UNetMLP(
         latent_dim=LATENT_DIM,
@@ -67,7 +74,12 @@ def train_ddpm_model(sensor_type: str, vae, dm, save_dir: str):
     ddpm_path = os.path.join(save_dir, f"ddpm_best_{sensor_type.lower()}.pt")
     if not os.path.exists(ddpm_path):
         print(f"DDPM model not found at {ddpm_path}, starting training...")
-        ddpm, ddpm_hist = train_ddpm(unet, Z_train, C_train, Z_val, C_val, save_dir, sensor_type=sensor_type)
+        ddpm, ddpm_hist = train_ddpm(
+            unet, Z_train, C_train, Z_val, C_val, save_dir,
+            sensor_type=sensor_type,
+            z_mean=z_mean,
+            z_std=z_std,
+        )
         ddpm_hist_path = os.path.join(save_dir, f"ddpm_history_{sensor_type.lower()}.json")
         with open(ddpm_hist_path, 'w') as f:
             json.dump({k: [float(v) for v in vals] for k, vals in ddpm_hist.items()}, f, indent=2)
@@ -75,6 +87,10 @@ def train_ddpm_model(sensor_type: str, vae, dm, save_dir: str):
         print(f"Found existing DDPM model at {ddpm_path}, skipping training...")
         unet.load_state_dict(torch.load(ddpm_path, map_location=DEVICE))
         ddpm = LatentDDPM(unet, T=T, beta_schedule=BETA_SCHEDULE, device=DEVICE)
+        
+        if isinstance(checkpoint, dict) and checkpoint.get("z_mean") is not None and checkpoint.get("z_std") is not None:
+            ddpm.z_mean = torch.tensor(checkpoint["z_mean"], dtype=torch.float32, device=DEVICE)
+            ddpm.z_std = torch.tensor(checkpoint["z_std"], dtype=torch.float32, device=DEVICE)
     
     unet.eval()
     return ddpm, unet
@@ -91,11 +107,11 @@ def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm):
     synth_windows = []
     synth_user_ids = []
     
-    # Get unique user IDs and try to match with synthetic data
+    
     unique_real_user_ids = np.unique(real_user_ids)
     
     for user_id in unique_real_user_ids[:20]:
-        # user_id is already the actual user ID, convert to string to match synth_df
+        
         user_id_str = str(user_id)
         user_synth = synth_df[synth_df["__user_id__"] == user_id_str]
         
@@ -105,7 +121,7 @@ def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm):
                 synth_windows.append(user_data[i:i+WINDOW_SIZE])
                 synth_user_ids.append(user_id)
     
-    # If we still don't have enough windows, use all available synthetic data
+    
     if len(synth_windows) < len(real_windows) and len(synth_df) >= WINDOW_SIZE:
         print(f"Warning: Only found {len(synth_windows)} matching synthetic windows, using all available synthetic data")
         all_synth_data = synth_df[["Xvalue", "Yvalue", "Zvalue"]].values
@@ -113,11 +129,11 @@ def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm):
             if len(synth_windows) >= len(real_windows):
                 break
             synth_windows.append(all_synth_data[i:i+WINDOW_SIZE])
-            # Use the user_id from the synthetic data
+            
             synth_user_id = synth_df.iloc[i]["__user_id__"]
-            # Try to find matching real user_id, or use the synthetic one
+            
             try:
-                # Try to convert back to match real user_ids format
+                
                 synth_user_ids.append(int(synth_user_id) if synth_user_id.isdigit() else synth_user_id)
             except:
                 synth_user_ids.append(synth_user_id)
@@ -175,11 +191,10 @@ def main(skip_eda: bool = False):
         synth_windows = []
         synth_user_ids = []
         
-        # Get unique user IDs and try to match with synthetic data
+        
         unique_real_user_ids = np.unique(real_user_ids)
         
         for user_id in unique_real_user_ids[:20]:
-            # user_id is already the actual user ID, convert to string to match synth_df
             user_id_str = str(user_id)
             user_synth = synth_df[synth_df["__user_id__"] == user_id_str]
             
@@ -189,7 +204,6 @@ def main(skip_eda: bool = False):
                     synth_windows.append(user_data[i:i+WINDOW_SIZE])
                     synth_user_ids.append(user_id)
         
-        # If we still don't have enough windows, use all available synthetic data
         if len(synth_windows) < len(real_windows) and len(synth_df) >= WINDOW_SIZE:
             print(f"Warning: Only found {len(synth_windows)} matching synthetic windows, using all available synthetic data")
             all_synth_data = synth_df[["Xvalue", "Yvalue", "Zvalue"]].values
@@ -197,11 +211,9 @@ def main(skip_eda: bool = False):
                 if len(synth_windows) >= len(real_windows):
                     break
                 synth_windows.append(all_synth_data[i:i+WINDOW_SIZE])
-                # Use the user_id from the synthetic data
+                
                 synth_user_id = synth_df.iloc[i]["__user_id__"]
-                # Try to find matching real user_id, or use the synthetic one
                 try:
-                    # Try to convert back to match real user_ids format
                     synth_user_ids.append(int(synth_user_id) if synth_user_id.isdigit() else synth_user_id)
                 except:
                     synth_user_ids.append(synth_user_id)
