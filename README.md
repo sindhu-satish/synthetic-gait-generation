@@ -102,7 +102,41 @@ The model consists of two main components:
    pip install -r requirements.txt
    ```
 
-4. **Verify dataset structure**:
+4. **Download and extract the BB-MAS dataset**:
+   
+   First, install unzip if you don't have it (on Ubuntu/Debian):
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y unzip
+   ```
+   
+   Create a `.env` file in the project root with the dataset download URL. You can copy the example file:
+   ```bash
+   cp .env.example .env
+   ```
+   
+   Then edit `.env` and replace the placeholder URL with your actual download URL. Get the download URL from [IEEE DataPort](https://ieee-dataport.org/open-access/bb-mas-dataset). The URL is a signed S3 URL that expires after a certain time, so you'll need to obtain a fresh URL from the dataset page.
+   
+   Download and extract the dataset:
+   ```bash
+   # Load the URL from .env file
+   source .env
+   
+   # Download the dataset
+   curl -L --fail --retry 5 --retry-delay 2 \
+     -o BB-MAS_Dataset.zip \
+     "$BB_MAS_DATASET_URL"
+   
+   # Extract the dataset
+   unzip BB-MAS_Dataset.zip
+   
+   # Clean up the zip file (optional)
+   rm BB-MAS_Dataset.zip
+   ```
+   
+   Alternatively, if you prefer to download manually, you can download the zip file from IEEE DataPort and extract it to the project root directory.
+
+5. **Verify dataset structure**:
    Ensure the BB-MAS dataset is located at:
    ```
    synthetic-gait-generation/BB-MAS_Dataset/BB-MAS_Dataset/{user_id}/*PocketPhone*{sensor_type}*.csv
