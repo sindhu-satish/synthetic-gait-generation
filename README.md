@@ -1,8 +1,8 @@
-# Keystroke Dynamics Synthetic Data Generation
+# Synthetic Gait Generation
 
-A deep learning system for generating synthetic keystroke dynamics data using a 1D Latent Diffusion Model, with identity preservation across multiple devices (Desktop, Phone, Tablet).
+A deep learning system for generating synthetic gait sensor data using a Variational Autoencoder (VAE) and Denoising Diffusion Probabilistic Model (DDPM). The system learns to generate realistic accelerometer and gyroscope signals from the BB-MAS dataset while preserving user-specific gait characteristics.
 
-## 📋 Table of Contents
+## Table of Contents
 
 - [Overview](#overview)
 - [What This Application Does](#what-this-application-does)
@@ -11,9 +11,11 @@ A deep learning system for generating synthetic keystroke dynamics data using a 
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Full Pipeline](#full-pipeline)
   - [Training](#training)
   - [Generation](#generation)
   - [Evaluation](#evaluation)
+  - [Ablation Studies](#ablation-studies)
 - [Configuration](#configuration)
 - [Output Files](#output-files)
 - [Model Details](#model-details)
@@ -21,114 +23,78 @@ A deep learning system for generating synthetic keystroke dynamics data using a 
 
 ## Overview
 
-This project implements a **Stable Diffusion-style architecture** adapted for 1D time-series keystroke data. The model learns to generate realistic keystroke timing patterns (Flight times and Keyhold durations) while preserving user identity characteristics across different input devices.
+This project implements a two-stage generative model for synthesizing gait sensor data. The model first compresses gait signal windows into a latent space using a VAE, then learns to generate new latent representations using a DDPM. The generated data maintains statistical properties and user-specific characteristics of real gait patterns.
 
 ### Key Features
 
-- **Identity Preservation**: Maintains user-specific keystroke patterns across devices
-- **Multi-Device Support**: Generates data for Desktop, Phone, and Tablet
-- **Latent Diffusion**: Uses VAE + U-Net architecture for high-quality generation
-- **Comprehensive Evaluation**: Includes authentication performance, statistical similarity, and identity preservation metrics
+- Dual sensor support: Generates data for both Accelerometer and Gyroscope sensors
+- Physics-informed losses: Incorporates smoothness, distribution, and spectral losses to ensure realistic signal properties
+- User identity preservation: Conditions generation on user embeddings to maintain individual gait characteristics
+- Comprehensive evaluation: Includes realism tests, statistical comparisons, and augmentation effectiveness studies
+- Ablation studies: Systematic analysis of model components and hyperparameters
 
 ## What This Application Does
 
-1. **Data Loading & Preprocessing**:
-   - Loads keystroke feature files (Flight1-4, Keyhold) from the BB-MAS dataset
-   - Creates sliding windows of keystroke sequences
-   - Normalizes timing data using log transform + z-score + min-max scaling
-   - Splits data by user ID to prevent data leakage
+1. **Data Loading and Preprocessing**:
+   - Loads accelerometer and gyroscope CSV files from the BB-MAS dataset
+   - Extracts X, Y, Z sensor values from PocketPhone recordings
+   - Creates sliding windows of fixed length (128 timesteps) with configurable stride
+   - Normalizes sensor data and splits by user ID to prevent data leakage
 
 2. **Model Training**:
-   - Trains a Variational Autoencoder (VAE) to compress keystroke windows into latent space
-   - Trains a 1D U-Net diffusion model to generate latent representations
-   - Uses identity loss with warm-up schedule to preserve user characteristics
-   - Conditions generation on user and device embeddings
+   - Trains a VAE encoder/decoder to compress gait windows into latent representations
+   - Uses KL divergence with cosine warm-up schedule
+   - Applies physics-informed losses (smoothness, distribution matching, spectral similarity)
+   - Trains a DDPM model to generate new latent representations
+   - Conditions generation on user identity embeddings
+   - Supports Exponential Moving Average (EMA) for model stability
 
 3. **Synthetic Data Generation**:
-   - Generates synthetic keystroke windows for specified users and devices
-   - Reconstructs Flight and Keyhold features from generated windows
-   - Properly denormalizes timing values back to milliseconds
-   - Saves synthetic data in BB-MAS dataset format (CSV files)
+   - Samples new latent representations from the trained DDPM
+   - Decodes latents back to sensor windows using the VAE decoder
+   - Generates data for specified users and sensor types
+   - Outputs synthetic data in the same format as the original dataset
 
 4. **Evaluation**:
-   - **Authentication Performance**: Tests if synthetic data improves user authentication
-   - **Statistical Similarity**: Compares distributions using KS-tests and t-tests
-   - **Identity Preservation**: Measures how well user identity is maintained in synthetic data
+   - Real vs Synthetic Classifier: Tests if a classifier can distinguish real from synthetic data
+   - Statistical Tests: Compares distributions using Kolmogorov-Smirnov tests and other statistical measures
+   - Augmentation Effectiveness: Evaluates whether synthetic data improves downstream task performance
+   - Exploratory Data Analysis: Visual comparisons of real and synthetic signal characteristics
 
 ## Architecture
 
-The model consists of three main components:
+The model consists of two main components:
 
 1. **VAE Encoder/Decoder**:
-   - Encodes keystroke windows (256 × 5) → latent space (64 × 64)
-   - Decodes latent representations back to keystroke windows
-   - Uses 1D convolutions for temporal processing
+   - Encodes gait windows (128 × 3) into latent space (256 dimensions)
+   - Uses 1D convolutions with residual blocks for temporal processing
+   - Implements GroupNorm and SiLU activations
+   - Applies physics-informed regularization during training
 
-2. **1D U-Net Diffusion Model**:
-   - Denoises latent representations over 1000 diffusion steps
-   - Conditions on user embeddings (128-dim) and device embeddings (32-dim)
-   - Uses attention mechanisms and residual connections
-
-3. **Identity Classifier**:
-   - Auxiliary classifier to enforce identity preservation
-   - Trained with warm-up schedule (starts at epoch 25)
-   - Helps maintain user-specific patterns in generated data
-
-## Project Structure
-
-```
-CS228/
-├── README.md                          # This file
-├── requirements.txt                   # Python dependencies
-├── BB-MAS_Dataset/                    # Dataset directory
-│   └── BB-MAS_Dataset/
-│       ├── Keystroke_Features/        # Input keystroke feature files
-│       │   ├── {user_id}_Flight1_{device}.csv
-│       │   ├── {user_id}_Flight2_{device}.csv
-│       │   ├── {user_id}_Flight3_{device}.csv
-│       │   ├── {user_id}_Flight4_{device}.csv
-│       │   └── {user_id}_Keyhold_{device}.csv
-│       └── Demographics.csv           # User demographic information
-│
-└── src/
-    └── keystroke_generation/          # Main application code
-        ├── config.py                  # Configuration parameters
-        ├── data_loader.py             # Data loading and preprocessing
-        ├── model.py                   # Model architecture (VAE + U-Net)
-        ├── train.py                   # Training script
-        ├── generate.py                # Synthetic data generation
-        ├── evaluate.py                # Evaluation metrics
-        ├── checkpoints/               # Saved model checkpoints
-        │   ├── best_model.pt
-        │   └── final_model.pt
-        ├── logs/                      # Training history
-        │   └── training_history.json
-        ├── synthetic_data/            # Generated synthetic data
-        │   ├── {user_id}_Flight1_{device}.csv
-        │   ├── {user_id}_Flight2_{device}.csv
-        │   ├── {user_id}_Flight3_{device}.csv
-        │   ├── {user_id}_Flight4_{device}.csv
-        │   └── {user_id}_Keyhold_{device}.csv
-        └── evaluation_results.json   # Evaluation metrics output
-```
+2. **DDPM (Denoising Diffusion Probabilistic Model)**:
+   - Generates latent representations through iterative denoising
+   - Uses cosine noise schedule over 400 diffusion steps
+   - Conditions on user identity embeddings
+   - Implements variance matching loss for better distribution alignment
+   - Supports EMA for improved generation quality
 
 ## Prerequisites
 
-- **Python**: 3.8 or higher
-- **CUDA**: Optional, but recommended for GPU acceleration (CUDA 11.8+)
-- **Dataset**: BB-MAS dataset with keystroke feature files
+- Python: 3.8 or higher
+- CUDA: Optional, but recommended for GPU acceleration (CUDA 11.8+)
+- Dataset: BB-MAS dataset with gait sensor CSV files organized by user folders
 
 ## Installation
 
-1. **Clone or navigate to the project directory**:
+1. **Navigate to the project directory**:
    ```bash
-   cd /path/to/CS228
+   cd /path/to/synthetic-gait-generation
    ```
 
 2. **Create a virtual environment** (recommended):
    ```bash
    python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   source venv/bin/activate 
    ```
 
 3. **Install dependencies**:
@@ -139,217 +105,262 @@ CS228/
 4. **Verify dataset structure**:
    Ensure the BB-MAS dataset is located at:
    ```
-   CS228/BB-MAS_Dataset/BB-MAS_Dataset/Keystroke_Features/
+   synthetic-gait-generation/BB-MAS_Dataset/BB-MAS_Dataset/{user_id}/*PocketPhone*{sensor_type}*.csv
    ```
 
 ## Usage
 
-### Training
+### Full Pipeline
 
-Train the model on the BB-MAS keystroke dataset:
+Run the complete training and evaluation pipeline:
 
 ```bash
-cd src/keystroke_generation
-python train.py
+cd src/gait_generation
+python -m gait_generation.main
 ```
 
-**What happens during training**:
-- Loads all keystroke feature files from the dataset
+Or with options:
+
+```bash
+# Skip EDA analysis
+python -m gait_generation.main --skip-eda
+
+# Run ablation studies instead
+python -m gait_generation.main ablations
+```
+
+The full pipeline will:
+- Train VAE models for both Accelerometer and Gyroscope sensors
+- Train DDPM models for both sensors
+- Generate synthetic data
+- Run EDA analysis (unless skipped)
+- Evaluate realism and augmentation effectiveness
+
+### Training
+
+Training is handled automatically by the full pipeline, but you can also train models programmatically:
+
+```bash
+cd src/gait_generation
+python -c "from gait_generation.run_full_pipeline import main; main()"
+```
+
+**Training process**:
+- Loads sensor data from the BB-MAS dataset
 - Creates train/validation/test splits (70%/15%/15%) by user ID
-- Trains the VAE encoder/decoder and diffusion model
-- Implements identity loss warm-up (starts at epoch 25)
-- Saves checkpoints to `checkpoints/best_model.pt` and `checkpoints/final_model.pt`
-- Logs training history to `logs/training_history.json`
+- Trains VAE with KL warm-up schedule and physics losses
+- Encodes training data to latent space
+- Trains DDPM on latent representations
+- Saves checkpoints to `checkpoints/gait/{sensor_type}/`
 
 **Training parameters** (configurable in `config.py`):
-- Batch size: 32
-- Learning rate: 5e-5
-- Number of epochs: 100
-- Identity loss warm-up: 25 epochs
-- Early stopping: Enabled
+- VAE batch size: 256
+- VAE learning rate: 1e-3
+- VAE epochs: 50
+- KL warm-up epochs: 20
+- DDPM batch size: 512
+- DDPM learning rate: 2e-4
+- DDPM epochs: 200
+- Diffusion steps: 400
 
 ### Generation
 
-Generate synthetic keystroke data using a trained model:
+Generate synthetic gait data using trained models:
 
-```bash
-cd src/keystroke_generation
-python generate.py [num_windows] [user_ids] [devices]
+```python
+from gait_generation.generate import sample_synthetic
+from gait_generation.diffusion import LatentDDPM
+from gait_generation.vae import WindowVAE
+from gait_generation.data import GaitDataModule
+
+# Load trained models and data module
+# ... (see generate.py for details)
+
+# Generate synthetic data
+synth_df = sample_synthetic(n=2048, ddpm=ddpm, vae=vae, dm=dm)
 ```
 
-**Examples**:
-
-```bash
-# Generate 10 windows per user-device pair for all users and devices
-python generate.py 10
-
-# Generate 20 windows for specific users
-python generate.py 20 1,2,3,10,20
-
-# Generate for specific users and devices
-python generate.py 15 1,2,3 Desktop,Phone
-
-# Generate for all users but only Desktop device
-python generate.py 10 "" Desktop
-```
-
-**Arguments**:
-- `num_windows` (optional): Number of windows to generate per user-device pair (default: 10)
-- `user_ids` (optional): Comma-separated list of user IDs (default: all users)
-- `devices` (optional): Comma-separated list of device names (default: all devices)
-
-**Output**: Synthetic CSV files saved to `synthetic_data/` directory in BB-MAS format.
+The generated data is returned as a pandas DataFrame with columns:
+- `EID`: Event ID (timestep index)
+- `Xvalue`, `Yvalue`, `Zvalue`: Sensor values
+- `__user_id__`: User identifier
+- `__sensor_type__`: Sensor type (Accelerometer or Gyroscope)
 
 ### Evaluation
 
-Evaluate the quality of generated synthetic data:
+Evaluation runs automatically as part of the full pipeline. It includes:
+
+1. **Real vs Synthetic Classifier**:
+   - Trains a classifier to distinguish real from synthetic data
+   - Lower accuracy indicates more realistic synthetic data
+
+2. **Statistical Tests**:
+   - Kolmogorov-Smirnov tests on feature distributions
+   - Mean and variance comparisons
+   - Correlation analysis
+
+3. **Augmentation Effectiveness**:
+   - Tests whether synthetic data improves downstream task performance
+   - Compares models trained on real data alone vs real + synthetic data
+
+Results are saved to `checkpoints/gait/{sensor_type}/evaluation/`
+
+### Ablation Studies
+
+Run systematic ablation studies to analyze model components:
 
 ```bash
-cd src/keystroke_generation
-python evaluate.py
+cd src/gait_generation
+python -m gait_generation.main ablations
 ```
 
-**What the evaluation does**:
-
-1. **Authentication Performance**:
-   - Trains a Random Forest classifier on real data
-   - Tests on real + synthetic data
-   - Computes Accuracy, ROC-AUC, and Equal Error Rate (EER)
-
-2. **Statistical Similarity**:
-   - Performs Kolmogorov-Smirnov (KS) tests on feature distributions
-   - Performs t-tests on mean values
-   - Compares real vs synthetic data distributions
-
-3. **Identity Preservation**:
-   - Trains an identity classifier on real data
-   - Tests on synthetic data
-   - Measures user identification accuracy
-
-**Output**: Results saved to `evaluation_results.json`
+Ablation studies examine:
+- VAE architecture variations
+- DDPM hyperparameter sensitivity
+- Loss function contributions
+- Conditioning strategies
 
 ## Configuration
 
-Edit `src/keystroke_generation/config.py` to customize:
+Edit `src/gait_generation/config.py` to customize:
 
 ### Data Parameters
 ```python
-WINDOW_LENGTH = 256        # Length of keystroke windows
-NUM_FEATURES = 5           # Flight1, Flight2, Flight3, Flight4, Keyhold
-NUM_USERS = 117            # Number of users in dataset
-DEVICES = ["Desktop", "Phone", "Tablet"]
+GAIT_BASE_DIR = "BB-MAS_Dataset/BB-MAS_Dataset"
+SENSOR_TYPES = ("Accelerometer", "Gyroscope")
+WINDOW_SIZE = 128
+WINDOW_STRIDE = 64
+TEST_SIZE = 0.15
+VAL_SIZE = 0.15
 ```
 
 ### Model Architecture
 ```python
-LATENT_DIM = 64            # Latent space dimension
-EMBED_DIM = 128            # User embedding dimension
-DEVICE_EMBED_DIM = 32      # Device embedding dimension
-VAE_HIDDEN_DIM = 256       # VAE hidden layer dimension
+LATENT_DIM = 256
+HIDDEN_DIM = 1024
+N_LAYERS = 4
+CAT_EMBED_DIM = 16
+DROPOUT = 0.05
 ```
 
 ### Training Hyperparameters
 ```python
-BATCH_SIZE = 32
-LEARNING_RATE = 5e-5
-NUM_EPOCHS = 100
-IDENTITY_WARMUP_EPOCHS = 25
-FINAL_IDENTITY_LOSS_WEIGHT = 0.001
-TRAIN_SPLIT = 0.7
-VAL_SPLIT = 0.15
-TEST_SPLIT = 0.15
+VAE_EPOCHS = 50
+VAE_BATCH_SIZE = 256
+VAE_LR = 1e-3
+KL_MAX_BETA = 1.0
+KL_WARMUP_EPOCHS = 20
+
+DDPM_EPOCHS = 200
+DDPM_BATCH_SIZE = 512
+DDPM_LR = 2e-4
+DDPM_PATIENCE = 60
 ```
 
 ### Diffusion Parameters
 ```python
-NUM_DIFFUSION_STEPS = 1000
-BETA_START = 0.0001
-BETA_END = 0.02
-NOISE_SCHEDULE = "linear"
+T = 400
+BETA_SCHEDULE = "cosine"
+SAMPLE_STEPS = 300
+DDPM_USE_EMA = True
+DDPM_EMA_DECAY = 0.9999
+```
+
+### Physics Losses
+```python
+USE_SMOOTHNESS_LOSS = True
+USE_DISTRIBUTION_LOSS = True
+LAMBDA_SMOOTH = 1e-3
+LAMBDA_PHYS = 5e-3
+LAMBDA_SPECTRAL = 1e-2
 ```
 
 ## Output Files
 
 ### Checkpoints
-- `checkpoints/best_model.pt`: Best model based on validation loss
-- `checkpoints/final_model.pt`: Final model after training completes
+- `checkpoints/gait/{sensor_type}/vae_best_{sensor_type}.pt`: Best VAE model
+- `checkpoints/gait/{sensor_type}/ddpm_best_{sensor_type}.pt`: Best DDPM model
+- `checkpoints/gait/{sensor_type}/vae_history_{sensor_type}.json`: VAE training history
+- `checkpoints/gait/{sensor_type}/ddpm_history_{sensor_type}.json`: DDPM training history
 
-### Synthetic Data
-- `synthetic_data/{user_id}_Flight1_{device}.csv`
-- `synthetic_data/{user_id}_Flight2_{device}.csv`
-- `synthetic_data/{user_id}_Flight3_{device}.csv`
-- `synthetic_data/{user_id}_Flight4_{device}.csv`
-- `synthetic_data/{user_id}_Keyhold_{device}.csv`
+### Evaluation Results
+- `checkpoints/gait/{sensor_type}/evaluation/`: Evaluation metrics and visualizations
+- Classification results, statistical test outputs, and augmentation study results
 
-Each CSV file contains:
-- **Flight files**: `key1`, `key2`, `time` columns
-- **Keyhold files**: `key`, `keyhold` columns
-
-### Logs
-- `logs/training_history.json`: Training metrics per epoch (loss, validation loss, etc.)
-
-### Evaluation
-- `evaluation_results.json`: Comprehensive evaluation metrics
+### EDA Outputs
+- `checkpoints/gait/{sensor_type}/eda/`: Exploratory data analysis plots and comparisons
 
 ## Model Details
 
 ### Input Format
-- **Keystroke Windows**: Shape `(256, 5)` where:
-  - 256 = window length (number of keystrokes)
-  - 5 = features (Flight1, Flight2, Flight3, Flight4, Keyhold)
+- **Gait Windows**: Shape `(128, 3)` where:
+  - 128 = window length (number of timesteps)
+  - 3 = sensor channels (X, Y, Z values)
 
-### Normalization Process
-1. **Log transform**: `log(1 + time_ms)`
-2. **Z-score normalization**: `(log_times - mean) / std`
-3. **Min-max scaling**: `(z_scores - z_min) / (z_max - z_min)` → [0, 1]
+### Normalization
+Sensor data is normalized using z-score normalization per channel, computed across the training set.
 
-### Denormalization Process (Generation)
-1. **Reverse min-max**: `z_scores = normalized * z_range + z_min`
-2. **Reverse z-score**: `log_times = z_scores * std + mean`
-3. **Reverse log**: `times = exp(log_times) - 1`
+### VAE Architecture
+- Encoder: 1D convolutions with residual blocks, downsampling to latent dimension
+- Decoder: 1D transposed convolutions with residual blocks, upsampling from latent to original dimensions
+- Latent space: 256-dimensional continuous representation
 
-### Identity Loss Warm-up
-- **Epochs 1-25**: Identity loss weight = 0.0 (model learns basic generation)
-- **Epochs 26-35**: Linear ramp from 0.0 to 0.001
-- **Epochs 36+**: Identity loss weight = 0.001 (identity preservation enforced)
+### DDPM Process
+- Forward process: Gradually adds Gaussian noise over 400 steps using cosine schedule
+- Reverse process: Neural network learns to denoise latent representations
+- Conditioning: User identity embeddings guide generation
+- Sampling: Uses DDIM-style sampling with configurable number of steps (default 300)
+
+### Physics-Informed Losses
+- **Smoothness Loss**: Encourages temporal smoothness in reconstructed signals
+- **Distribution Loss**: Matches statistical distribution of real data
+- **Spectral Loss**: Preserves frequency domain characteristics
 
 ## Troubleshooting
 
 ### Common Issues
 
 1. **CUDA Out of Memory**:
-   - Reduce `BATCH_SIZE` in `config.py`
+   - Reduce `VAE_BATCH_SIZE` or `DDPM_BATCH_SIZE` in `config.py`
    - Use CPU by setting `DEVICE = "cpu"` in `config.py`
 
 2. **No Checkpoint Found**:
-   - Ensure you've run `train.py` first
-   - Check that `checkpoints/` directory exists and contains model files
+   - Ensure you've run the training pipeline first
+   - Check that `checkpoints/gait/{sensor_type}/` directory exists and contains model files
 
 3. **Dataset Not Found**:
-   - Verify dataset path in `config.py`: `DATASET_DIR = PROJECT_ROOT / "BB-MAS_Dataset" / "BB-MAS_Dataset"`
-   - Ensure `Keystroke_Features/` directory exists with CSV files
+   - Verify dataset path in `config.py`: `GAIT_BASE_DIR = "BB-MAS_Dataset/BB-MAS_Dataset"`
+   - Ensure user folders (1-117) exist with PocketPhone CSV files
+   - Check file naming pattern: `*PocketPhone*{sensor_type}*.csv`
 
 4. **Import Errors**:
    - Activate virtual environment: `source venv/bin/activate`
    - Reinstall dependencies: `pip install -r requirements.txt`
+   - Ensure you're running from the correct directory
 
 5. **Generation Produces Unrealistic Values**:
-   - Check that denormalization is working correctly
-   - Verify normalization statistics in `generate.py` match training data
-   - Ensure model was trained on the same dataset
+   - Check that models were trained on the same dataset
+   - Verify normalization statistics match between training and generation
+   - Ensure sufficient training epochs and proper convergence
 
 ### Performance Tips
 
 - **GPU Acceleration**: Set `DEVICE = "cuda"` in `config.py` (requires CUDA-compatible GPU)
-- **Faster Training**: Increase `BATCH_SIZE` if you have more GPU memory
-- **Memory Efficiency**: Reduce `WINDOW_LENGTH` or `NUM_FEATURES` if needed
+- **Faster Training**: Increase batch sizes if you have more GPU memory
+- **Memory Efficiency**: Reduce `WINDOW_SIZE` or `LATENT_DIM` if needed
+- **Faster Sampling**: Reduce `SAMPLE_STEPS` for quicker generation (may reduce quality)
 
 ## Dependencies
 
 See `requirements.txt` for full list:
 - `torch>=2.0.0`: PyTorch for deep learning
+- `pytorch-lightning>=2.0.0`: Training utilities
 - `numpy>=1.24.0`: Numerical operations
 - `pandas>=2.0.0`: Data manipulation
 - `scikit-learn>=1.3.0`: Machine learning utilities
 - `scipy>=1.10.0`: Statistical functions
 - `tqdm>=4.65.0`: Progress bars
+- `einops>=0.7.0`: Tensor operations
+- `matplotlib>=3.7.0`: Plotting
+- `seaborn>=0.13.2`: Statistical visualization
+- `umap-learn>=0.5.9.post2`: Dimensionality reduction for visualization
