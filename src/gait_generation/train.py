@@ -1,4 +1,5 @@
 import os
+import json
 import math
 import numpy as np
 import torch
@@ -12,9 +13,13 @@ from .config import (
     VAE_LR, VAE_EPOCHS, VAE_PATIENCE, KL_MAX_BETA, KL_WARMUP_EPOCHS, KL_BETA,
     USE_SMOOTHNESS_LOSS, USE_DISTRIBUTION_LOSS, LAMBDA_SMOOTH, LAMBDA_PHYS, LAMBDA_SPECTRAL,
     DEVICE, DDPM_LR, DDPM_EPOCHS, DDPM_PATIENCE, DDPM_BATCH_SIZE, T, BETA_SCHEDULE,
-    NUM_WORKERS, DDPM_USE_MU_ONLY, DDPM_USE_EMA, DDPM_EMA_DECAY, PIN_MEMORY, LAMBDA_VAR
+    NUM_WORKERS, DDPM_USE_MU_ONLY, DDPM_USE_EMA, DDPM_EMA_DECAY, PIN_MEMORY, LAMBDA_VAR,
+    DDPM_EVAL_INTERVAL, DDPM_EVAL_BATCH_SIZE, DDPM_EVAL_SEED, DDPM_REALISM_HF_CUTOFF_HZ,
+    DDPM_REALISM_JERK_PERCENTILE, DDPM_REALISM_SCORE_WEIGHTS, DDPM_REALISM_PATIENCE,
+    DDPM_REALISM_MIN_DELTA, IMU_FS_HZ, WINDOW_SIZE
 )
 from .physics_losses import smoothness_loss, distribution_loss, spectral_loss
+from .metrics import compute_realism_metrics
 
 def kl_cosine_beta(epoch, warmup_epochs, max_beta=1.0):
     if warmup_epochs <= 0:
@@ -141,6 +146,60 @@ def train_vae(vae, dm: GaitDataModule, save_dir: str, sensor_type: str = None):
     return history
 
 @torch.no_grad()
+def generate_fixed_eval_samples(
+    ddpm: LatentDDPM,
+    vae: WindowVAE,
+    n_samples: int,
+    fixed_cond_idx: np.ndarray | None,
+    eval_seed: int,
+    steps: int = None
+) -> np.ndarray:
+    """
+    Generate fixed evaluation samples with deterministic seed.
+    
+    Args:
+        ddpm: Trained DDPM model
+        vae: Trained VAE model
+        n_samples: Number of samples to generate
+        fixed_cond_idx: Fixed conditioning indices (shape: (n_samples,))
+        eval_seed: Fixed random seed for reproducibility
+        steps: Number of sampling steps (default: SAMPLE_STEPS)
+        
+    Returns:
+        Generated windows as numpy array (n_samples, T, 3)
+    """
+    from .config import SAMPLE_STEPS, set_seed
+    
+    if steps is None:
+        steps = SAMPLE_STEPS
+    
+    
+    set_seed(eval_seed)
+    torch.manual_seed(eval_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(eval_seed)
+    
+    
+    if fixed_cond_idx is not None:
+        cond_tensor = torch.tensor(fixed_cond_idx, device=DEVICE, dtype=torch.long)
+    else:
+        cond_tensor = None
+    Z = ddpm.sample(n=n_samples, cond_idx=cond_tensor, steps=steps).to(DEVICE)
+    
+    
+    if hasattr(ddpm, "z_mean") and hasattr(ddpm, "z_std") and ddpm.z_mean is not None and ddpm.z_std is not None:
+        Z = Z * ddpm.z_std + ddpm.z_mean
+    
+    
+    recon_flat = vae.decode(Z)
+    recon_windows = recon_flat.view(n_samples, WINDOW_SIZE, 3)
+    
+    
+    windows_np = recon_windows.detach().cpu().numpy()
+    return windows_np
+
+
+@torch.no_grad()
 def encode_dataset_to_latents(ds, vae, batch_size=1024):
     from torch.utils.data import DataLoader
     latents, conds = [], []
@@ -172,6 +231,8 @@ def train_ddpm(
     sensor_type: str = None,
     z_mean: np.ndarray | None = None,
     z_std: np.ndarray | None = None,
+    vae: WindowVAE = None,
+    dm: GaitDataModule = None,
 ):
     ddpm = LatentDDPM(model, T=T, beta_schedule=BETA_SCHEDULE, device=DEVICE)
     if z_mean is not None and z_std is not None:
@@ -209,7 +270,44 @@ def train_ddpm(
     bad = 0
     history = {"train": [], "val": []}
     
+    
+    use_realism_metrics = (vae is not None and dm is not None)
+    best_realism_score = float("inf")
+    realism_bad = 0
+    realism_patience = DDPM_REALISM_PATIENCE
+    
+    
+    fixed_cond_idx = None
+    if use_realism_metrics:
+        if C_val is not None and len(C_val) > 0:
+            n_eval = min(DDPM_EVAL_BATCH_SIZE, len(C_val))
+            unique_conds = np.unique(C_val)
+            if len(unique_conds) >= n_eval:
+                fixed_cond_idx = np.tile(unique_conds[:n_eval], (DDPM_EVAL_BATCH_SIZE // n_eval + 1))[:DDPM_EVAL_BATCH_SIZE]
+            else:
+                fixed_cond_idx = np.tile(unique_conds, (DDPM_EVAL_BATCH_SIZE // len(unique_conds) + 1))[:DDPM_EVAL_BATCH_SIZE]
+            fixed_cond_idx = fixed_cond_idx.astype(np.int64)
+        elif C_train is not None and len(C_train) > 0:
+            unique_conds = np.unique(C_train)
+            n_eval = min(DDPM_EVAL_BATCH_SIZE, len(unique_conds))
+            if len(unique_conds) >= n_eval:
+                fixed_cond_idx = np.tile(unique_conds[:n_eval], (DDPM_EVAL_BATCH_SIZE // n_eval + 1))[:DDPM_EVAL_BATCH_SIZE]
+            else:
+                fixed_cond_idx = np.tile(unique_conds, (DDPM_EVAL_BATCH_SIZE // len(unique_conds) + 1))[:DDPM_EVAL_BATCH_SIZE]
+            fixed_cond_idx = fixed_cond_idx.astype(np.int64)
+    
+    
+    real_val_windows = None
+    if use_realism_metrics and dm.val_ds is not None:
+        real_windows_list = []
+        n_real = min(DDPM_EVAL_BATCH_SIZE, len(dm.val_ds))
+        for i in range(n_real):
+            real_windows_list.append(dm.val_ds[i]["window"].numpy())
+        if real_windows_list:
+            real_val_windows = np.array(real_windows_list)
+    
     ddpm_filename = f"ddpm_best_{sensor_type.lower()}.pt" if sensor_type else "ddpm_best.pt"
+    ddpm_realism_filename = f"ddpm_best_by_realism_{sensor_type.lower()}.pt" if sensor_type else "ddpm_best_by_realism.pt"
     
     for epoch in range(DDPM_EPOCHS):
         model.train()
@@ -309,6 +407,96 @@ def train_ddpm(
             f"train_mse {tr_mse:.4f} | val_mse {va_mse:.4f} | "
             f"train_var {tr_var:.6f} | val_var {va_var:.6f}"
         )
+        
+        realism_metrics = None
+        composite_score = None
+        should_eval_realism = use_realism_metrics and ((epoch + 1) % DDPM_EVAL_INTERVAL == 0 or epoch == 0)
+        
+        if should_eval_realism:
+            eval_model = ema_model if ema_model is not None else model
+            eval_model.eval()
+            eval_ddpm = LatentDDPM(eval_model, T=T, beta_schedule=BETA_SCHEDULE, device=DEVICE)
+            if z_mean is not None and z_std is not None:
+                eval_ddpm.z_mean = torch.tensor(z_mean, dtype=torch.float32, device=DEVICE)
+                eval_ddpm.z_std = torch.tensor(z_std, dtype=torch.float32, device=DEVICE)
+            
+            vae.eval()
+            synth_windows = generate_fixed_eval_samples(
+                eval_ddpm, vae, DDPM_EVAL_BATCH_SIZE, fixed_cond_idx, DDPM_EVAL_SEED
+            )
+            
+            realism_metrics = compute_realism_metrics(
+                synth_windows,
+                fs_hz=IMU_FS_HZ,
+                hf_cutoff_hz=DDPM_REALISM_HF_CUTOFF_HZ,
+                jerk_percentile=DDPM_REALISM_JERK_PERCENTILE
+            )
+            
+            w1, w2, w3 = DDPM_REALISM_SCORE_WEIGHTS
+            composite_score = (
+                w1 * realism_metrics["hf_power_ratio_mean"] +
+                w2 * realism_metrics["jerk_tail_mean"] +
+                w3 * realism_metrics["dom_tail_mass_mean"]
+            )
+            
+            print(
+                f"  [Realism] hf_ratio={realism_metrics['hf_power_ratio_mean']:.4f} "
+                f"jerk_tail={realism_metrics['jerk_tail_mean']:.4f} "
+                f"tail_mass={realism_metrics['dom_tail_mass_mean']:.4f} "
+                f"composite={composite_score:.4f}"
+            )
+            
+            for key, val in realism_metrics.items():
+                history_key = f"realism_{key}"
+                if history_key not in history:
+                    history[history_key] = []
+                history[history_key].append(val)
+            
+            if "realism_composite_score" not in history:
+                history["realism_composite_score"] = []
+            history["realism_composite_score"].append(composite_score)
+            
+            eval_log = {
+                "epoch": epoch + 1,
+                "val_total": va_total,
+                **realism_metrics,
+                "composite_score": composite_score,
+            }
+            realism_log_path = os.path.join(save_dir, f"realism_metrics_{sensor_type.lower() if sensor_type else 'ddpm'}.jsonl")
+            with open(realism_log_path, "a") as f:
+                f.write(json.dumps(eval_log) + "\n")
+            
+            if composite_score < (best_realism_score - DDPM_REALISM_MIN_DELTA):
+                best_realism_score = composite_score
+                realism_bad = 0
+                ddpm_realism_path = os.path.join(save_dir, ddpm_realism_filename)
+                save_model = ema_model if ema_model is not None else model
+                torch.save({
+                    "model_state_dict": save_model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "ema_decay": DDPM_EMA_DECAY if ema_model is not None else None,
+                    "num_timesteps": ddpm.num_timesteps,
+                    "z_mean": z_mean,
+                    "z_std": z_std,
+                    "realism_metrics": realism_metrics,
+                    "composite_score": composite_score,
+                    "epoch": epoch + 1,
+                }, ddpm_realism_path)
+                print(f"  → Saved best realism model: {ddpm_realism_path} (composite_score: {composite_score:.4f})")
+            else:
+                realism_bad += 1
+                if realism_bad >= realism_patience:
+                    best_epoch = epoch + 1 - realism_patience * DDPM_EVAL_INTERVAL
+                    print(
+                        f"Early stopping DDPM (realism metrics). "
+                        f"Best epoch: {best_epoch}, "
+                        f"best score: {best_realism_score:.4f}, "
+                        f"current score: {composite_score:.4f}"
+                    )
+                    break
+        else:
+            if "realism_composite_score" in history:
+                history["realism_composite_score"].append(None)
 
         if va_total < best_val:
             best_val = va_total
@@ -323,11 +511,11 @@ def train_ddpm(
                 "z_mean": z_mean,
                 "z_std": z_std,
             }, ddpm_path)
-            print(f"  → Saved best DDPM model: {ddpm_path} (val_total: {va_total:.4f})")
+            print(f"  → Saved best val_total model: {ddpm_path} (val_total: {va_total:.4f})")
         else:
             bad += 1
-            if bad >= patience:
-                print("Early stopping DDPM.")
+            if not use_realism_metrics and bad >= patience:
+                print("Early stopping DDPM (val_total).")
                 break
 
     final_model = ema_model if ema_model is not None else model

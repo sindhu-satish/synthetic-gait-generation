@@ -80,13 +80,22 @@ def train_ddpm_model(sensor_type: str, vae, dm, save_dir: str):
             sensor_type=sensor_type,
             z_mean=z_mean,
             z_std=z_std,
+            vae=vae,
+            dm=dm,
         )
         ddpm_hist_path = os.path.join(save_dir, f"ddpm_history_{sensor_type.lower()}.json")
         with open(ddpm_hist_path, 'w') as f:
-            json.dump({k: [float(v) for v in vals] for k, vals in ddpm_hist.items()}, f, indent=2)
+            cleaned_hist = {}
+            for k, vals in ddpm_hist.items():
+                cleaned_hist[k] = [float(v) if v is not None else None for v in vals]
+            json.dump(cleaned_hist, f, indent=2)
     else:
         print(f"Found existing DDPM model at {ddpm_path}, skipping training...")
-        unet.load_state_dict(torch.load(ddpm_path, map_location=DEVICE))
+        checkpoint = torch.load(ddpm_path, map_location=DEVICE)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            unet.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            unet.load_state_dict(checkpoint)
         ddpm = LatentDDPM(unet, T=T, beta_schedule=BETA_SCHEDULE, device=DEVICE)
         
         if isinstance(checkpoint, dict) and checkpoint.get("z_mean") is not None and checkpoint.get("z_std") is not None:
