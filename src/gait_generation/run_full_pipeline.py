@@ -16,6 +16,7 @@ from .eda.gait_signal_analysis import load_windows_from_data, run_eda
 from .evaluation.real_vs_synthetic_classifier import evaluate_real_vs_synthetic
 from .evaluation.statistical_tests import run_statistical_tests
 from .evaluation.augmentation_effectiveness import run_augmentation_experiment
+from .postprocess import PostprocessConfig, postprocess_windows
 
 def train_windowed_vae(sensor_type: str, save_dir: str = None):
     print(f"\n{'='*60}")
@@ -95,7 +96,7 @@ def train_ddpm_model(sensor_type: str, vae, dm, save_dir: str):
     unet.eval()
     return ddpm, unet
 
-def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm):
+def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm, post_cfg: PostprocessConfig, fs_hz: float):
     print(f"\n{'='*60}")
     print(f"Running EDA for {sensor_type}")
     print(f"{'='*60}\n")
@@ -141,10 +142,22 @@ def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm):
     synth_windows = np.array(synth_windows[:len(real_windows)]) if len(synth_windows) > 0 else np.array([])
     synth_user_ids = np.array(synth_user_ids[:len(real_windows)]) if len(synth_user_ids) > 0 else np.array([])
     
-    eda_save_dir = os.path.join(save_dir, "eda")
-    run_eda(real_windows, real_user_ids, synth_windows, synth_user_ids, sensor_type, eda_save_dir)
+    synth_windows_post = None
+    if synth_windows.size > 0 and (post_cfg.enable_fft_lowpass or post_cfg.enable_savgol):
+        synth_windows_post, _ = postprocess_windows(
+            synth_windows, fs=fs_hz, config=post_cfg, log_prefix=f"[{sensor_type}][EDA]"
+        )
 
-def run_realism_evaluation(sensor_type: str, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir: str):
+    eda_save_dir = os.path.join(save_dir, "eda")
+    run_eda(
+        real_windows, real_user_ids,
+        synth_windows, synth_user_ids,
+        sensor_type, eda_save_dir,
+        fs_hz=fs_hz,
+        synth_windows_post=synth_windows_post,
+    )
+
+def run_realism_evaluation(sensor_type: str, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir: str, post_cfg: PostprocessConfig, fs_hz: float):
     print(f"\n{'='*60}")
     print(f"Running Realism Evaluation for {sensor_type}")
     print(f"{'='*60}\n")
@@ -152,33 +165,69 @@ def run_realism_evaluation(sensor_type: str, real_windows, real_user_ids, synth_
     eval_save_dir = os.path.join(save_dir, "evaluation")
     os.makedirs(eval_save_dir, exist_ok=True)
     
-    classifier_results = evaluate_real_vs_synthetic(
-        real_windows, synth_windows, sensor_type, eval_save_dir
-    )
     
-    stats_results = run_statistical_tests(
-        real_windows, synth_windows, sensor_type, eval_save_dir
-    )
+    raw_dir = os.path.join(eval_save_dir, "raw")
+    classifier_results = evaluate_real_vs_synthetic(real_windows, synth_windows, sensor_type, raw_dir)
+    stats_results = run_statistical_tests(real_windows, synth_windows, sensor_type, raw_dir)
+
+
+    if synth_windows is not None and len(synth_windows) > 0 and (post_cfg.enable_fft_lowpass or post_cfg.enable_savgol):
+        synth_post, _ = postprocess_windows(
+            synth_windows, fs=fs_hz, config=post_cfg, log_prefix=f"[{sensor_type}][Eval]"
+        )
+        post_dir = os.path.join(eval_save_dir, "postprocessed")
+        _ = evaluate_real_vs_synthetic(real_windows, synth_post, sensor_type, post_dir)
+        _ = run_statistical_tests(real_windows, synth_post, sensor_type, post_dir)
     
     return classifier_results, stats_results
 
-def run_augmentation_experiment_wrapper(sensor_type: str, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir: str):
+def run_augmentation_experiment_wrapper(sensor_type: str, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir: str, post_cfg: PostprocessConfig, fs_hz: float):
     print(f"\n{'='*60}")
     print(f"Running Augmentation Experiment for {sensor_type}")
     print(f"{'='*60}\n")
     
     eval_save_dir = os.path.join(save_dir, "evaluation")
+    
+    raw_dir = os.path.join(eval_save_dir, "raw")
     augmentation_results = run_augmentation_experiment(
         real_windows, real_user_ids, synth_windows, synth_user_ids,
-        sensor_type, eval_save_dir
+        sensor_type, raw_dir
     )
+
+    if synth_windows is not None and len(synth_windows) > 0 and (post_cfg.enable_fft_lowpass or post_cfg.enable_savgol):
+        synth_post, _ = postprocess_windows(
+            synth_windows, fs=fs_hz, config=post_cfg, log_prefix=f"[{sensor_type}][Aug]"
+        )
+        post_dir = os.path.join(eval_save_dir, "postprocessed")
+        _ = run_augmentation_experiment(
+            real_windows, real_user_ids, synth_post, synth_user_ids,
+            sensor_type, post_dir
+        )
     
     return augmentation_results
 
-def main(skip_eda: bool = False):
+def main(
+    skip_eda: bool = False,
+    post_fft: bool = False,
+    post_savgol: bool = False,
+    fs: float | None = None,
+    fft_fc: float | None = None,
+    savgol_window: int | None = None,
+    savgol_poly: int | None = None,
+):
     set_seed(SEED)
     
     os.makedirs(SAVE_DIR, exist_ok=True)
+
+    from .config import IMU_FS_HZ, POST_FFT_CUTOFF_HZ, POST_SAVGOL_WINDOW_LENGTH, POST_SAVGOL_POLYORDER
+    fs_hz = float(IMU_FS_HZ if fs is None else fs)
+    post_cfg = PostprocessConfig(
+        enable_fft_lowpass=bool(post_fft),
+        fft_cutoff_hz=float(POST_FFT_CUTOFF_HZ if fft_fc is None else fft_fc),
+        enable_savgol=bool(post_savgol),
+        savgol_window_length=int(POST_SAVGOL_WINDOW_LENGTH if savgol_window is None else savgol_window),
+        savgol_polyorder=int(POST_SAVGOL_POLYORDER if savgol_poly is None else savgol_poly),
+    )
     
     for sensor_type in SENSOR_TYPES:
         vae, dm, save_dir = train_windowed_vae(sensor_type, SAVE_DIR)
@@ -222,14 +271,14 @@ def main(skip_eda: bool = False):
         synth_user_ids = np.array(synth_user_ids[:len(real_windows)]) if len(synth_user_ids) > 0 else np.array([])
         
         if not skip_eda:
-            run_eda_analysis(sensor_type, dm, save_dir, vae, ddpm)
+            run_eda_analysis(sensor_type, dm, save_dir, vae, ddpm, post_cfg=post_cfg, fs_hz=fs_hz)
         else:
             print(f"\n{'='*60}")
             print(f"Skipping EDA for {sensor_type} (skip_eda=True)")
             print(f"{'='*60}\n")
         
-        run_realism_evaluation(sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir)
-        run_augmentation_experiment_wrapper(sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir)
+        run_realism_evaluation(sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir, post_cfg=post_cfg, fs_hz=fs_hz)
+        run_augmentation_experiment_wrapper(sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir, post_cfg=post_cfg, fs_hz=fs_hz)
         
         print(f"\n{'='*60}")
         print(f"Pipeline complete for {sensor_type}")
