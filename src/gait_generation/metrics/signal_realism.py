@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from typing import Dict, Tuple, Optional
 
+_hf_power_ratio_logged = False
 
 def compute_hf_power_ratio(
     windows: np.ndarray,
@@ -21,8 +22,31 @@ def compute_hf_power_ratio(
     Returns:
         (mean_ratio, p95_ratio) across windows
     """
+    global _hf_power_ratio_logged
+    
     if windows.size == 0 or windows.shape[0] == 0:
         return 0.0, 0.0
+    
+    if not _hf_power_ratio_logged and windows.shape[0] > 0:
+        n_fft = windows.shape[1]
+        nyquist_hz = fs_hz / 2.0
+        freq_resolution_hz = fs_hz / float(n_fft)
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs_hz)
+        cutoff_bin_idx = int(np.sum(freqs <= cutoff_hz))
+        if cutoff_bin_idx >= len(freqs):
+            cutoff_bin_idx = len(freqs) - 1
+        
+        print(f"\n{'='*70}")
+        print(f"[Evaluation Metrics - HF Power Ratio] Spectral Parameters:")
+        print(f"{'='*70}")
+        print(f"  Sampling frequency (fs):           {fs_hz:.2f} Hz")
+        print(f"  FFT length (n_fft):                {n_fft}")
+        print(f"  Nyquist frequency (fs/2):          {nyquist_hz:.2f} Hz")
+        print(f"  Frequency resolution (fs/n_fft):   {freq_resolution_hz:.4f} Hz")
+        print(f"  Cutoff frequency (HF > {cutoff_hz} Hz): {cutoff_hz:.2f} Hz")
+        print(f"  Computed cutoff bin index:         {cutoff_bin_idx}")
+        print(f"{'='*70}\n")
+        _hf_power_ratio_logged = True
     
     ratios = []
     nyquist = fs_hz / 2.0

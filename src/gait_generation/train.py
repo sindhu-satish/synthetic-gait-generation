@@ -23,6 +23,8 @@ from .config import (
 from .physics_losses import smoothness_loss, distribution_loss, spectral_loss
 from .metrics import compute_realism_metrics
 
+_spectral_loss_logged = False
+
 def compute_smoothness_loss_ddpm(x0_pred_windows):
     """
     Smoothness loss on first differences (targets jerk spikes).
@@ -52,8 +54,31 @@ def compute_spectral_loss_ddpm(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
     eps: Small epsilon for numerical stability
     Returns: Mean hf_ratio across windows
     """
+    global _spectral_loss_logged
+    
     B, T, C = x0_pred_windows.shape
     device = x0_pred_windows.device
+    
+    if not _spectral_loss_logged:
+        n_fft = T
+        nyquist_hz = fs_hz / 2.0
+        freq_resolution_hz = fs_hz / float(n_fft)
+        freqs = torch.fft.rfftfreq(n_fft, d=1.0 / float(fs_hz), device=device)
+        cutoff_bin_idx = torch.sum(freqs <= cutoff_hz).item()
+        if cutoff_bin_idx >= len(freqs):
+            cutoff_bin_idx = len(freqs) - 1
+        
+        print(f"\n{'='*70}")
+        print(f"[DDPM Training - Spectral Loss] Spectral Parameters:")
+        print(f"{'='*70}")
+        print(f"  Sampling frequency (fs):           {fs_hz:.2f} Hz")
+        print(f"  FFT length (n_fft):                {n_fft}")
+        print(f"  Nyquist frequency (fs/2):          {nyquist_hz:.2f} Hz")
+        print(f"  Frequency resolution (fs/n_fft):   {freq_resolution_hz:.4f} Hz")
+        print(f"  Cutoff frequency (HF > {cutoff_hz} Hz): {cutoff_hz:.2f} Hz")
+        print(f"  Computed cutoff bin index:         {cutoff_bin_idx}")
+        print(f"{'='*70}\n")
+        _spectral_loss_logged = True
     
     hf_ratios = []
     for b in range(B):
