@@ -16,10 +16,67 @@ from .config import (
     NUM_WORKERS, DDPM_USE_MU_ONLY, DDPM_USE_EMA, DDPM_EMA_DECAY, PIN_MEMORY, LAMBDA_VAR,
     DDPM_EVAL_INTERVAL, DDPM_EVAL_BATCH_SIZE, DDPM_EVAL_SEED, DDPM_REALISM_HF_CUTOFF_HZ,
     DDPM_REALISM_JERK_PERCENTILE, DDPM_REALISM_SCORE_WEIGHTS, DDPM_REALISM_PATIENCE,
-    DDPM_REALISM_MIN_DELTA, IMU_FS_HZ, WINDOW_SIZE
+    DDPM_REALISM_MIN_DELTA, IMU_FS_HZ, WINDOW_SIZE,
+    DDPM_W_SMOOTH, DDPM_W_JERK, DDPM_W_SPEC, DDPM_SPEC_CUTOFF_HZ, DDPM_SPEC_FMIN_HZ,
+    DDPM_SAMPLING_RATE_HZ, DDPM_SPEC_EPS
 )
 from .physics_losses import smoothness_loss, distribution_loss, spectral_loss
 from .metrics import compute_realism_metrics
+
+def compute_smoothness_loss_ddpm(x0_pred_windows):
+    """
+    Smoothness loss on first differences (targets jerk spikes).
+    x0_pred_windows: (B, T, 3) tensor of predicted windows
+    Returns: L1 loss on first differences
+    """
+    dx = x0_pred_windows[:, 1:, :] - x0_pred_windows[:, :-1, :]
+    return torch.abs(dx).mean()
+
+def compute_jerk_loss_ddpm(x0_pred_windows):
+    """
+    Jerk suppression loss on second differences (targets impulses).
+    x0_pred_windows: (B, T, 3) tensor of predicted windows
+    Returns: L1 loss on second differences
+    """
+    dx = x0_pred_windows[:, 1:, :] - x0_pred_windows[:, :-1, :]
+    d2x = dx[:, 1:, :] - dx[:, :-1, :]
+    return torch.abs(d2x).mean()
+
+def compute_spectral_loss_ddpm(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
+    """
+    Spectral high-frequency penalty (targets hf_ratio and tail_mass).
+    x0_pred_windows: (B, T, 3) tensor of predicted windows
+    fs_hz: Sampling rate in Hz
+    cutoff_hz: High frequency cutoff (default 10 Hz)
+    fmin_hz: Minimum frequency to consider (default 0.5 Hz to ignore DC)
+    eps: Small epsilon for numerical stability
+    Returns: Mean hf_ratio across windows
+    """
+    B, T, C = x0_pred_windows.shape
+    device = x0_pred_windows.device
+    
+    hf_ratios = []
+    for b in range(B):
+        window_ratios = []
+        for c in range(C):
+            x = x0_pred_windows[b, :, c].float()
+            
+            X = torch.fft.rfft(x)
+            freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs_hz), device=device)
+            power = torch.abs(X) ** 2
+            
+            mask_above_fmin = freqs > float(fmin_hz)
+            mask_above_cutoff = freqs > float(cutoff_hz)
+            
+            total_power = power[mask_above_fmin].sum() + eps
+            hf_power = power[mask_above_cutoff].sum()
+            
+            hf_ratio = hf_power / total_power
+            window_ratios.append(hf_ratio)
+        
+        hf_ratios.append(torch.stack(window_ratios).mean())
+    
+    return torch.stack(hf_ratios).mean()
 
 def kl_cosine_beta(epoch, warmup_epochs, max_beta=1.0):
     if warmup_epochs <= 0:
@@ -309,11 +366,19 @@ def train_ddpm(
     ddpm_filename = f"ddpm_best_{sensor_type.lower()}.pt" if sensor_type else "ddpm_best.pt"
     ddpm_realism_filename = f"ddpm_best_by_realism_{sensor_type.lower()}.pt" if sensor_type else "ddpm_best_by_realism.pt"
     
+    if vae is not None:
+        vae.eval()
+        for param in vae.parameters():
+            param.requires_grad = False
+    
     for epoch in range(DDPM_EPOCHS):
         model.train()
         epoch_total = []
         epoch_mse = []
         epoch_var_loss = []
+        epoch_smooth = []
+        epoch_jerk = []
+        epoch_spec = []
         for z0, cond in train_loader:
             z0 = z0.to(DEVICE)
             cond = cond.to(DEVICE)
@@ -323,6 +388,32 @@ def train_ddpm(
             noise_pred = model(zt, t, cond)
             
             mse_loss = F.mse_loss(noise_pred, noise)
+            
+            sqrt_ac = ddpm.sqrt_alphas_cumprod[t][:, None]
+            sqrt_om = ddpm.sqrt_one_minus_alphas_cumprod[t][:, None]
+            x0_pred_latent = (zt - sqrt_om * noise_pred) / (sqrt_ac + 1e-8)
+            
+            smooth_loss_val = torch.tensor(0.0, device=DEVICE)
+            jerk_loss_val = torch.tensor(0.0, device=DEVICE)
+            spec_loss_val = torch.tensor(0.0, device=DEVICE)
+            
+            if vae is not None and (DDPM_W_SMOOTH > 0 or DDPM_W_JERK > 0 or DDPM_W_SPEC > 0):
+                x0_pred_latent.requires_grad_(True)
+                x0_pred_windows_flat = vae.decode(x0_pred_latent)
+                x0_pred_windows = x0_pred_windows_flat.view(z0.shape[0], WINDOW_SIZE, 3)
+                
+                if DDPM_W_SMOOTH > 0:
+                    smooth_loss_val = compute_smoothness_loss_ddpm(x0_pred_windows)
+                if DDPM_W_JERK > 0:
+                    jerk_loss_val = compute_jerk_loss_ddpm(x0_pred_windows)
+                if DDPM_W_SPEC > 0:
+                    spec_loss_val = compute_spectral_loss_ddpm(
+                        x0_pred_windows,
+                        fs_hz=DDPM_SAMPLING_RATE_HZ,
+                        cutoff_hz=DDPM_SPEC_CUTOFF_HZ,
+                        fmin_hz=DDPM_SPEC_FMIN_HZ,
+                        eps=DDPM_SPEC_EPS
+                    )
             
             t0 = torch.zeros_like(t)
             noise0 = torch.randn_like(z0)
@@ -337,7 +428,13 @@ def train_ddpm(
             eps = 1e-8
             var_loss = F.mse_loss(torch.log(synthetic_var + eps), torch.log(real_var + eps))
             
-            loss = mse_loss + LAMBDA_VAR * var_loss
+            loss = (
+                mse_loss
+                + LAMBDA_VAR * var_loss
+                + DDPM_W_SMOOTH * smooth_loss_val
+                + DDPM_W_JERK * jerk_loss_val
+                + DDPM_W_SPEC * spec_loss_val
+            )
             
             opt.zero_grad()
             loss.backward()
@@ -348,15 +445,27 @@ def train_ddpm(
             epoch_total.append(loss.item())
             epoch_mse.append(mse_loss.item())
             epoch_var_loss.append(var_loss.item())
+            epoch_smooth.append(smooth_loss_val.item() if isinstance(smooth_loss_val, torch.Tensor) else smooth_loss_val)
+            epoch_jerk.append(jerk_loss_val.item() if isinstance(jerk_loss_val, torch.Tensor) else jerk_loss_val)
+            epoch_spec.append(spec_loss_val.item() if isinstance(spec_loss_val, torch.Tensor) else spec_loss_val)
         tr_total = float(np.mean(epoch_total))
         tr_mse = float(np.mean(epoch_mse))
         tr_var = float(np.mean(epoch_var_loss))
+        tr_smooth = float(np.mean(epoch_smooth))
+        tr_jerk = float(np.mean(epoch_jerk))
+        tr_spec = float(np.mean(epoch_spec))
         history["train_total"] = history.get("train_total", [])
         history["train_total"].append(tr_total)
         history["train_mse"] = history.get("train_mse", [])
         history["train_mse"].append(tr_mse)
         history["train_var"] = history.get("train_var", [])
         history["train_var"].append(tr_var)
+        history["train_smooth"] = history.get("train_smooth", [])
+        history["train_smooth"].append(tr_smooth)
+        history["train_jerk"] = history.get("train_jerk", [])
+        history["train_jerk"].append(tr_jerk)
+        history["train_spec"] = history.get("train_spec", [])
+        history["train_spec"].append(tr_spec)
 
         model.eval()
         v_total = []
@@ -405,7 +514,8 @@ def train_ddpm(
             f"[DDPM] epoch {epoch+1:03d} | "
             f"train_total {tr_total:.4f} | val_total {va_total:.4f} | "
             f"train_mse {tr_mse:.4f} | val_mse {va_mse:.4f} | "
-            f"train_var {tr_var:.6f} | val_var {va_var:.6f}"
+            f"train_var {tr_var:.6f} | val_var {va_var:.6f} | "
+            f"train_smooth {tr_smooth:.6f} | train_jerk {tr_jerk:.6f} | train_spec {tr_spec:.6f}"
         )
         
         realism_metrics = None
