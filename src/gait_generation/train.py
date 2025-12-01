@@ -80,28 +80,33 @@ def compute_spectral_loss_ddpm(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
         print(f"{'='*70}\n")
         _spectral_loss_logged = True
     
-    hf_ratios = []
-    for b in range(B):
-        window_ratios = []
-        for c in range(C):
-            x = x0_pred_windows[b, :, c].float()
-            
-            X = torch.fft.rfft(x)
-            freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs_hz), device=device)
-            power = torch.abs(X) ** 2
-            
-            mask_above_fmin = freqs > float(fmin_hz)
-            mask_above_cutoff = freqs > float(cutoff_hz)
-            
-            total_power = power[mask_above_fmin].sum() + eps
-            hf_power = power[mask_above_cutoff].sum()
-            
-            hf_ratio = hf_power / total_power
-            window_ratios.append(hf_ratio)
-        
-        hf_ratios.append(torch.stack(window_ratios).mean())
+    # Vectorized FFT computation: process all (B, C) axes at once
+    x_flat = x0_pred_windows.float()  # (B, T, C)
+    x_flat = x_flat.transpose(1, 2).contiguous()  # (B, C, T) for FFT along time dim
     
-    return torch.stack(hf_ratios).mean()
+    # Compute FFT for all windows and channels at once
+    X = torch.fft.rfft(x_flat, dim=2)  # (B, C, n_freq)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs_hz), device=device)  # (n_freq,)
+    power = torch.abs(X) ** 2  # (B, C, n_freq)
+    
+    # Create masks (same for all windows/channels)
+    mask_above_fmin = freqs > float(fmin_hz)  # (n_freq,)
+    mask_above_cutoff = freqs > float(cutoff_hz)  # (n_freq,)
+    
+    # Compute total and HF power for all (B, C) pairs
+    # Expand masks to match power shape: (n_freq,) -> (1, 1, n_freq) for broadcasting
+    mask_fmin_expanded = mask_above_fmin[None, None, :]  # (1, 1, n_freq)
+    mask_cutoff_expanded = mask_above_cutoff[None, None, :]  # (1, 1, n_freq)
+    
+    total_power = (power * mask_fmin_expanded).sum(dim=2) + eps  # (B, C)
+    hf_power = (power * mask_cutoff_expanded).sum(dim=2)  # (B, C)
+    
+    # Compute hf_ratio for each (window, channel) pair
+    hf_ratios_per_axis = hf_power / total_power  # (B, C)
+    
+    # Average across channels for each window, then across windows
+    hf_ratios_per_window = hf_ratios_per_axis.mean(dim=1)  # (B,)
+    return hf_ratios_per_window.mean()  # scalar
 
 def kl_cosine_beta(epoch, warmup_epochs, max_beta=1.0):
     if warmup_epochs <= 0:
