@@ -590,6 +590,9 @@ def train_ddpm(
         epoch_smooth = []
         epoch_jerk = []
         epoch_spec = []
+        epoch_rms = []
+        epoch_rms_pred_mean = []
+        epoch_rms_real_mean = []
         for z0, cond in train_loader:
             z0 = z0.to(DEVICE)
             cond = cond.to(DEVICE)
@@ -607,8 +610,11 @@ def train_ddpm(
             smooth_loss_val = torch.tensor(0.0, device=DEVICE)
             jerk_loss_val = torch.tensor(0.0, device=DEVICE)
             spec_loss_val = torch.tensor(0.0, device=DEVICE)
+            rms_loss_val = torch.tensor(0.0, device=DEVICE)
+            rms_pred_mean_val = torch.tensor(0.0, device=DEVICE)
+            rms_real_mean_val = torch.tensor(0.0, device=DEVICE)
             
-            if vae is not None and (DDPM_W_SMOOTH > 0 or DDPM_W_JERK > 0 or DDPM_W_SPEC > 0):
+            if vae is not None and (DDPM_W_SMOOTH > 0 or DDPM_W_JERK > 0 or DDPM_W_SPEC > 0 or (DDPM_ENABLE_RMS and DDPM_W_RMS > 0)):
                 x0_pred_latent.requires_grad_(True)
                 x0_pred_windows_flat = vae.decode(x0_pred_latent)
                 x0_pred_windows = x0_pred_windows_flat.view(z0.shape[0], WINDOW_SIZE, 3)
@@ -625,6 +631,22 @@ def train_ddpm(
                         fmin_hz=DDPM_SPEC_FMIN_HZ,
                         eps=DDPM_SPEC_EPS
                     )
+                
+                # RMS loss: decode z0 to get real windows for comparison
+                if DDPM_ENABLE_RMS and DDPM_W_RMS > 0:
+                    with torch.no_grad():
+                        x0_real_windows_flat = vae.decode(z0)
+                        x0_real_windows = x0_real_windows_flat.view(z0.shape[0], WINDOW_SIZE, 3)
+                    rms_loss_val = compute_rms_loss(x0_pred_windows, x0_real_windows, eps=1e-8)
+                    
+                    # Compute mean RMS values for logging
+                    eps_log = 1e-8
+                    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps_log)
+                    m_real = torch.sqrt((x0_real_windows ** 2).sum(dim=2) + eps_log)
+                    rms_pred = torch.sqrt((m_pred ** 2).mean(dim=1) + eps_log)
+                    rms_real = torch.sqrt((m_real ** 2).mean(dim=1) + eps_log)
+                    rms_pred_mean_val = rms_pred.mean()
+                    rms_real_mean_val = rms_real.mean()
             
             t0 = torch.zeros_like(t)
             noise0 = torch.randn_like(z0)
@@ -645,6 +667,7 @@ def train_ddpm(
                 + DDPM_W_SMOOTH * smooth_loss_val
                 + DDPM_W_JERK * jerk_loss_val
                 + DDPM_W_SPEC * spec_loss_val
+                + (DDPM_W_RMS * rms_loss_val if DDPM_ENABLE_RMS else 0.0)
             )
             
             opt.zero_grad()
@@ -659,12 +682,18 @@ def train_ddpm(
             epoch_smooth.append(smooth_loss_val.item() if isinstance(smooth_loss_val, torch.Tensor) else smooth_loss_val)
             epoch_jerk.append(jerk_loss_val.item() if isinstance(jerk_loss_val, torch.Tensor) else jerk_loss_val)
             epoch_spec.append(spec_loss_val.item() if isinstance(spec_loss_val, torch.Tensor) else spec_loss_val)
+            epoch_rms.append(rms_loss_val.item() if isinstance(rms_loss_val, torch.Tensor) else rms_loss_val)
+            epoch_rms_pred_mean.append(rms_pred_mean_val.item() if isinstance(rms_pred_mean_val, torch.Tensor) else rms_pred_mean_val)
+            epoch_rms_real_mean.append(rms_real_mean_val.item() if isinstance(rms_real_mean_val, torch.Tensor) else rms_real_mean_val)
         tr_total = float(np.mean(epoch_total))
         tr_mse = float(np.mean(epoch_mse))
         tr_var = float(np.mean(epoch_var_loss))
         tr_smooth = float(np.mean(epoch_smooth))
         tr_jerk = float(np.mean(epoch_jerk))
         tr_spec = float(np.mean(epoch_spec))
+        tr_rms = float(np.mean(epoch_rms))
+        tr_rms_pred_mean = float(np.mean(epoch_rms_pred_mean))
+        tr_rms_real_mean = float(np.mean(epoch_rms_real_mean))
         history["train_total"] = history.get("train_total", [])
         history["train_total"].append(tr_total)
         history["train_mse"] = history.get("train_mse", [])
@@ -677,6 +706,12 @@ def train_ddpm(
         history["train_jerk"].append(tr_jerk)
         history["train_spec"] = history.get("train_spec", [])
         history["train_spec"].append(tr_spec)
+        history["train_rms"] = history.get("train_rms", [])
+        history["train_rms"].append(tr_rms)
+        history["train_rms_pred_mean"] = history.get("train_rms_pred_mean", [])
+        history["train_rms_pred_mean"].append(tr_rms_pred_mean)
+        history["train_rms_real_mean"] = history.get("train_rms_real_mean", [])
+        history["train_rms_real_mean"].append(tr_rms_real_mean)
 
         model.eval()
         v_total = []
@@ -726,7 +761,8 @@ def train_ddpm(
             f"train_total {tr_total:.4f} | val_total {va_total:.4f} | "
             f"train_mse {tr_mse:.4f} | val_mse {va_mse:.4f} | "
             f"train_var {tr_var:.6f} | val_var {va_var:.6f} | "
-            f"train_smooth {tr_smooth:.6f} | train_jerk {tr_jerk:.6f} | train_spec {tr_spec:.6f}"
+            f"train_smooth {tr_smooth:.6f} | train_jerk {tr_jerk:.6f} | train_spec {tr_spec:.6f} | "
+            f"train_rms {tr_rms:.6f} | rms_pred_mean {tr_rms_pred_mean:.4f} | rms_real_mean {tr_rms_real_mean:.4f}"
         )
         
         realism_metrics = None
