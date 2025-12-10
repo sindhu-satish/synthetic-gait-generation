@@ -18,7 +18,10 @@ from .config import (
     DDPM_REALISM_JERK_PERCENTILE, DDPM_REALISM_SCORE_WEIGHTS, DDPM_REALISM_PATIENCE,
     DDPM_REALISM_MIN_DELTA, IMU_FS_HZ, WINDOW_SIZE,
     DDPM_W_SMOOTH, DDPM_W_JERK, DDPM_W_SPEC, DDPM_SPEC_CUTOFF_HZ, DDPM_SPEC_FMIN_HZ,
-    DDPM_SAMPLING_RATE_HZ, DDPM_SPEC_EPS
+    DDPM_SAMPLING_RATE_HZ, DDPM_SPEC_EPS,
+    DDPM_W_SPEC_MAG, DDPM_W_RMS, DDPM_W_CADENCE, DDPM_W_USER,
+    DDPM_ENABLE_SPEC_MAG, DDPM_ENABLE_RMS, DDPM_ENABLE_CADENCE, DDPM_ENABLE_USER,
+    DDPM_CADENCE_FMIN_HZ, DDPM_CADENCE_FMAX_HZ, SAVE_DIR
 )
 from .physics_losses import smoothness_loss, distribution_loss, spectral_loss
 from .metrics import compute_realism_metrics
@@ -107,6 +110,179 @@ def compute_spectral_loss_ddpm(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
     # Average across channels for each window, then across windows
     hf_ratios_per_window = hf_ratios_per_axis.mean(dim=1)  # (B,)
     return hf_ratios_per_window.mean()  # scalar
+
+def compute_spectral_loss_mag(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
+    """
+    Spectral high-frequency penalty computed on magnitude signal (aligned with tail_mass metric).
+    x0_pred_windows: (B, T, 3) tensor of predicted windows
+    fs_hz: Sampling rate in Hz
+    cutoff_hz: High frequency cutoff (default 10 Hz)
+    fmin_hz: Minimum frequency to consider (default 0.5 Hz to ignore DC)
+    eps: Small epsilon for numerical stability
+    Returns: Mean hf_ratio_mag across windows
+    """
+    B, T, C = x0_pred_windows.shape
+    device = x0_pred_windows.device
+    
+    # Compute magnitude per time-step: m[t] = sqrt(sum_c x[t,c]^2 + eps)
+    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    
+    # Compute FFT on magnitude signal
+    X_mag = torch.fft.rfft(m_pred, dim=1)  # (B, n_freq)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs_hz), device=device)  # (n_freq,)
+    power_mag = torch.abs(X_mag) ** 2  # (B, n_freq)
+    
+    # Create masks
+    mask_above_fmin = freqs > float(fmin_hz)  # (n_freq,)
+    mask_above_cutoff = freqs > float(cutoff_hz)  # (n_freq,)
+    
+    # Expand masks for broadcasting
+    mask_fmin_expanded = mask_above_fmin[None, :]  # (1, n_freq)
+    mask_cutoff_expanded = mask_above_cutoff[None, :]  # (1, n_freq)
+    
+    # Compute total and HF power
+    total_power = (power_mag * mask_fmin_expanded).sum(dim=1) + eps  # (B,)
+    hf_power = (power_mag * mask_cutoff_expanded).sum(dim=1)  # (B,)
+    
+    # Compute hf_ratio_mag per window
+    hf_ratios_mag = hf_power / total_power  # (B,)
+    
+    return hf_ratios_mag.mean()  # scalar
+
+def compute_rms_loss(x0_pred_windows, x0_real_windows, eps=1e-8):
+    """
+    RMS preservation loss to prevent damped dynamics.
+    x0_pred_windows: (B, T, 3) predicted windows
+    x0_real_windows: (B, T, 3) real windows (clean target)
+    eps: Small epsilon for numerical stability
+    Returns: Mean squared difference of RMS values
+    """
+    # Compute magnitude for both
+    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    m_real = torch.sqrt((x0_real_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    
+    # Compute RMS per window: sqrt(mean_t m^2)
+    rms_pred = torch.sqrt((m_pred ** 2).mean(dim=1) + eps)  # (B,)
+    rms_real = torch.sqrt((m_real ** 2).mean(dim=1) + eps)  # (B,)
+    
+    # Mean squared difference
+    return ((rms_pred - rms_real) ** 2).mean()
+
+def compute_cadence_loss(x0_pred_windows, x0_real_windows, fs_hz, fmin_hz, fmax_hz):
+    """
+    Cadence preservation loss (dominant frequency matching).
+    x0_pred_windows: (B, T, 3) predicted windows
+    x0_real_windows: (B, T, 3) real windows
+    fs_hz: Sampling rate in Hz
+    fmin_hz: Minimum frequency for cadence search
+    fmax_hz: Maximum frequency for cadence search
+    Returns: Mean squared difference of dominant frequencies
+    """
+    B, T, C = x0_pred_windows.shape
+    device = x0_pred_windows.device
+    eps = 1e-8
+    
+    # Compute magnitude for both
+    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    m_real = torch.sqrt((x0_real_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    
+    # Compute FFT on magnitude
+    X_pred = torch.fft.rfft(m_pred, dim=1)  # (B, n_freq)
+    X_real = torch.fft.rfft(m_real, dim=1)  # (B, n_freq)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs_hz), device=device)  # (n_freq,)
+    power_pred = torch.abs(X_pred) ** 2  # (B, n_freq)
+    power_real = torch.abs(X_real) ** 2  # (B, n_freq)
+    
+    # Find dominant frequency in plausible gait band (ignore DC)
+    mask_band = (freqs >= fmin_hz) & (freqs <= fmax_hz)  # (n_freq,)
+    mask_band_expanded = mask_band[None, :]  # (1, n_freq)
+    
+    # Mask power to band and find argmax (excluding DC)
+    power_pred_band = power_pred * mask_band_expanded  # (B, n_freq)
+    power_real_band = power_real * mask_band_expanded  # (B, n_freq)
+    
+    # Find dominant frequency index per sample
+    f_dom_pred_idx = power_pred_band.argmax(dim=1)  # (B,)
+    f_dom_real_idx = power_real_band.argmax(dim=1)  # (B,)
+    
+    # Convert to Hz
+    f_dom_pred = freqs[f_dom_pred_idx]  # (B,)
+    f_dom_real = freqs[f_dom_real_idx]  # (B,)
+    
+    # Mean squared difference
+    return ((f_dom_pred - f_dom_real) ** 2).mean(), f_dom_pred.mean(), f_dom_real.mean()
+
+def compute_user_magnitude_loss(x0_pred_windows, cond, user_target_mean_mag, eps=1e-8):
+    """
+    Per-user magnitude supervision loss.
+    x0_pred_windows: (B, T, 3) predicted windows
+    cond: (B,) conditioning indices (user IDs)
+    user_target_mean_mag: dict mapping user_id -> target mean magnitude
+    eps: Small epsilon for numerical stability
+    Returns: Mean squared difference of mean magnitudes per user
+    """
+    # Compute magnitude per time-step
+    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    
+    # Compute mean magnitude per sample
+    sample_mean_mag_pred = m_pred.mean(dim=1)  # (B,)
+    
+    # Lookup target mean magnitude for each sample
+    cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
+    target_mags = torch.tensor(
+        [user_target_mean_mag.get(int(uid), 10.0) for uid in cond_np],
+        device=x0_pred_windows.device,
+        dtype=x0_pred_windows.dtype
+    )  # (B,)
+    
+    # Mean squared difference
+    return ((sample_mean_mag_pred - target_mags) ** 2).mean()
+
+def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir: str = None):
+    """
+    Precompute per-user target mean magnitude from training set.
+    Returns: dict mapping user_id -> mean magnitude
+    """
+    if cache_dir is None:
+        cache_dir = SAVE_DIR
+    cache_path = os.path.join(cache_dir, f"{sensor_type.lower() if sensor_type else 'gait'}", "user_mag_stats.json")
+    
+    # Check cache
+    if os.path.exists(cache_path):
+        print(f"Loading cached user magnitude stats from {cache_path}")
+        with open(cache_path, 'r') as f:
+            return json.load(f)
+    
+    # Compute stats from training set
+    print(f"Computing user magnitude stats from training set...")
+    user_mags = defaultdict(list)
+    
+    for batch in dm.train_dataloader():
+        windows = batch["window"]  # (B, T, 3)
+        cond = batch["cond"]  # (B,)
+        
+        # Compute magnitude per window
+        m = torch.sqrt((windows ** 2).sum(dim=2) + 1e-8)  # (B, T)
+        mean_mag = m.mean(dim=1).numpy()  # (B,)
+        
+        # Group by user
+        cond_np = cond.numpy() if isinstance(cond, torch.Tensor) else cond
+        for uid, mag in zip(cond_np, mean_mag):
+            user_mags[int(uid)].append(float(mag))
+    
+    # Average per user
+    user_target_mean_mag = {
+        int(uid): float(np.mean(mags))
+        for uid, mags in user_mags.items()
+    }
+    
+    # Save cache
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, 'w') as f:
+        json.dump(user_target_mean_mag, f, indent=2)
+    print(f"Saved user magnitude stats to {cache_path}")
+    
+    return user_target_mean_mag
 
 def kl_cosine_beta(epoch, warmup_epochs, max_beta=1.0):
     if warmup_epochs <= 0:
@@ -362,6 +538,11 @@ def train_ddpm(
     best_realism_score = float("inf")
     realism_bad = 0
     realism_patience = DDPM_REALISM_PATIENCE
+    
+    # Precompute user magnitude stats if user supervision is enabled
+    user_target_mean_mag = None
+    if DDPM_ENABLE_USER and dm is not None:
+        user_target_mean_mag = compute_user_magnitude_stats(dm, sensor_type, save_dir)
     
     
     fixed_cond_idx = None

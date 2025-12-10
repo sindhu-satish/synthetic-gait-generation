@@ -137,7 +137,10 @@ class LatentDDPM(nn.Module):
         
         cond = None
         if cond_idx is not None:
-            cond = torch.tensor(cond_idx, device=self.device, dtype=torch.long)
+            if isinstance(cond_idx, torch.Tensor):
+                cond = cond_idx.to(device=self.device, dtype=torch.long)
+            else:
+                cond = torch.tensor(cond_idx, device=self.device, dtype=torch.long)
             if cond.ndim == 0:
                 cond = cond.repeat(n)
             if cond.shape[0] != n:
