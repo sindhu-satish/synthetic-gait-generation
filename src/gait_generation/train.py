@@ -19,7 +19,7 @@ from .config import (
     DDPM_REALISM_MIN_DELTA, IMU_FS_HZ, WINDOW_SIZE,
     DDPM_W_SMOOTH, DDPM_W_JERK, DDPM_W_SPEC, DDPM_SPEC_CUTOFF_HZ, DDPM_SPEC_FMIN_HZ,
     DDPM_SAMPLING_RATE_HZ, DDPM_SPEC_EPS,
-    DDPM_W_SPEC_MAG, DDPM_W_RMS, DDPM_W_CADENCE, DDPM_W_USER,
+    DDPM_W_SPEC_MAG, DDPM_W_RMS_USER, DDPM_W_ENERGY_USER, DDPM_W_LF, DDPM_W_CADENCE, DDPM_W_USER,
     DDPM_ENABLE_SPEC_MAG, DDPM_ENABLE_RMS, DDPM_ENABLE_CADENCE, DDPM_ENABLE_USER,
     DDPM_CADENCE_FMIN_HZ, DDPM_CADENCE_FMAX_HZ, SAVE_DIR
 )
@@ -149,13 +149,15 @@ def compute_spectral_loss_mag(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
     
     return hf_ratios_mag.mean()  # scalar
 
-def compute_rms_loss(x0_pred_windows, x0_real_windows, eps=1e-8):
+def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8):
     """
-    RMS preservation loss to prevent damped dynamics.
+    User-conditioned RMS preservation loss using z-scores.
     x0_pred_windows: (B, T, 3) predicted windows
     x0_real_windows: (B, T, 3) real windows (clean target)
+    cond: (B,) conditioning indices (user IDs)
+    user_stats: dict mapping user_id -> {mean_rms_mag, std_rms_mag, ...}
     eps: Small epsilon for numerical stability
-    Returns: Mean squared difference of RMS values
+    Returns: Mean squared difference of standardized RMS values, and raw RMS means for logging
     """
     # Compute magnitude for both
     m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
@@ -165,8 +167,147 @@ def compute_rms_loss(x0_pred_windows, x0_real_windows, eps=1e-8):
     rms_pred = torch.sqrt((m_pred ** 2).mean(dim=1) + eps)  # (B,)
     rms_real = torch.sqrt((m_real ** 2).mean(dim=1) + eps)  # (B,)
     
-    # Mean squared difference
-    return ((rms_pred - rms_real) ** 2).mean()
+    # Compute global stats for fallback
+    cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
+    all_rms_mean = np.mean([user_stats[uid]["mean_rms_mag"] for uid in user_stats.keys()])
+    all_rms_std = np.std([user_stats[uid]["mean_rms_mag"] for uid in user_stats.keys()])
+    all_rms_std = max(all_rms_std, 1e-3)
+    
+    # Standardize using user-specific stats
+    z_rms_pred = []
+    z_rms_real = []
+    missing_count = 0
+    
+    for i, uid in enumerate(cond_np):
+        uid_int = int(uid)
+        if uid_int in user_stats:
+            mu = user_stats[uid_int]["mean_rms_mag"]
+            sigma = max(user_stats[uid_int]["std_rms_mag"], 1e-3)
+        else:
+            mu = all_rms_mean
+            sigma = all_rms_std
+            missing_count += 1
+        
+        mu = max(mu, 1e-3)
+        z_rms_pred.append((rms_pred[i] - mu) / sigma)
+        z_rms_real.append((rms_real[i] - mu) / sigma)
+    
+    z_rms_pred = torch.stack(z_rms_pred)
+    z_rms_real = torch.stack(z_rms_real)
+    
+    loss = ((z_rms_pred - z_rms_real) ** 2).mean()
+    return loss, rms_pred.mean(), rms_real.mean(), missing_count
+
+def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8):
+    """
+    User-conditioned energy preservation loss using z-scores.
+    x0_pred_windows: (B, T, 3) predicted windows
+    x0_real_windows: (B, T, 3) real windows (clean target)
+    cond: (B,) conditioning indices (user IDs)
+    user_stats: dict mapping user_id -> {mean_energy_mag, std_energy_mag, ...}
+    eps: Small epsilon for numerical stability
+    Returns: Mean squared difference of standardized energy values, and raw energy means for logging
+    """
+    # Compute magnitude for both
+    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    m_real = torch.sqrt((x0_real_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    
+    # Compute energy per window: mean(m^2)
+    e_pred = (m_pred ** 2).mean(dim=1)  # (B,)
+    e_real = (m_real ** 2).mean(dim=1)  # (B,)
+    
+    # Compute global stats for fallback
+    cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
+    all_e_mean = np.mean([user_stats[uid]["mean_energy_mag"] for uid in user_stats.keys()])
+    all_e_std = np.std([user_stats[uid]["mean_energy_mag"] for uid in user_stats.keys()])
+    all_e_std = max(all_e_std, 1e-3)
+    
+    # Standardize using user-specific stats
+    z_e_pred = []
+    z_e_real = []
+    
+    for i, uid in enumerate(cond_np):
+        uid_int = int(uid)
+        if uid_int in user_stats:
+            mu = user_stats[uid_int]["mean_energy_mag"]
+            sigma = max(user_stats[uid_int]["std_energy_mag"], 1e-3)
+        else:
+            mu = all_e_mean
+            sigma = all_e_std
+        
+        mu = max(mu, 1e-3)
+        z_e_pred.append((e_pred[i] - mu) / sigma)
+        z_e_real.append((e_real[i] - mu) / sigma)
+    
+    z_e_pred = torch.stack(z_e_pred)
+    z_e_real = torch.stack(z_e_real)
+    
+    loss = ((z_e_pred - z_e_real) ** 2).mean()
+    return loss, e_pred.mean(), e_real.mean()
+
+_lf_loss_logged = False
+
+def compute_lf_energy_loss(x0_pred_windows, x0_real_windows, fs_hz, cutoff_hz=5.0, eps=1e-8):
+    """
+    Low-frequency energy ratio matching loss on magnitude signal.
+    x0_pred_windows: (B, T, 3) predicted windows
+    x0_real_windows: (B, T, 3) real windows
+    fs_hz: Sampling rate in Hz
+    cutoff_hz: Low frequency cutoff (default 5 Hz)
+    eps: Small epsilon for numerical stability
+    Returns: Mean squared difference of LF energy ratios, and raw ratios for logging
+    """
+    global _lf_loss_logged
+    
+    B, T, C = x0_pred_windows.shape
+    device = x0_pred_windows.device
+    
+    # Compute magnitude for both
+    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    m_real = torch.sqrt((x0_real_windows ** 2).sum(dim=2) + eps)  # (B, T)
+    
+    # Compute FFT on magnitude
+    X_pred = torch.fft.rfft(m_pred, dim=1)  # (B, n_freq)
+    X_real = torch.fft.rfft(m_real, dim=1)  # (B, n_freq)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs_hz), device=device)  # (n_freq,)
+    power_pred = torch.abs(X_pred) ** 2  # (B, n_freq)
+    power_real = torch.abs(X_real) ** 2  # (B, n_freq)
+    
+    # One-time logging
+    if not _lf_loss_logged:
+        n_fft = T
+        nyquist_hz = fs_hz / 2.0
+        freq_resolution_hz = fs_hz / float(n_fft)
+        cutoff_bin_idx = int(torch.sum(freqs <= cutoff_hz).item())
+        if cutoff_bin_idx >= len(freqs):
+            cutoff_bin_idx = len(freqs) - 1
+        
+        print(f"\n{'='*70}")
+        print(f"[DDPM Training - LF Energy Loss] Spectral Parameters:")
+        print(f"{'='*70}")
+        print(f"  Sampling frequency (fs):           {fs_hz:.2f} Hz")
+        print(f"  FFT length (n_fft):                {n_fft}")
+        print(f"  Nyquist frequency (fs/2):          {nyquist_hz:.2f} Hz")
+        print(f"  Frequency resolution (fs/n_fft):   {freq_resolution_hz:.4f} Hz")
+        print(f"  Cutoff frequency (LF <= {cutoff_hz} Hz): {cutoff_hz:.2f} Hz")
+        print(f"  Computed cutoff bin index:         {cutoff_bin_idx}")
+        print(f"{'='*70}\n")
+        _lf_loss_logged = True
+    
+    # Compute LF ratio: sum(power[f <= cutoff]) / sum(power)
+    mask_lf = freqs <= cutoff_hz  # (n_freq,)
+    mask_lf_expanded = mask_lf[None, :]  # (1, n_freq)
+    
+    lf_power_pred = (power_pred * mask_lf_expanded).sum(dim=1)  # (B,)
+    total_power_pred = power_pred.sum(dim=1)  # (B,)
+    lf_ratio_pred = lf_power_pred / (total_power_pred + eps)  # (B,)
+    
+    lf_power_real = (power_real * mask_lf_expanded).sum(dim=1)  # (B,)
+    total_power_real = power_real.sum(dim=1)  # (B,)
+    lf_ratio_real = lf_power_real / (total_power_real + eps)  # (B,)
+    
+    loss = ((lf_ratio_pred - lf_ratio_real) ** 2).mean()
+    return loss, lf_ratio_pred.mean(), lf_ratio_real.mean()
 
 def compute_cadence_loss(x0_pred_windows, x0_real_windows, fs_hz, fmin_hz, fmax_hz):
     """
@@ -240,8 +381,8 @@ def compute_user_magnitude_loss(x0_pred_windows, cond, user_target_mean_mag, eps
 
 def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir: str = None):
     """
-    Precompute per-user target mean magnitude from training set.
-    Returns: dict mapping user_id -> mean magnitude
+    Precompute per-user target RMS and energy stats from training set.
+    Returns: dict mapping user_id -> {mean_rms_mag, std_rms_mag, mean_energy_mag, std_energy_mag}
     """
     if cache_dir is None:
         cache_dir = SAVE_DIR
@@ -251,38 +392,57 @@ def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir
     if os.path.exists(cache_path):
         print(f"Loading cached user magnitude stats from {cache_path}")
         with open(cache_path, 'r') as f:
-            return json.load(f)
+            cached = json.load(f)
+            # Handle backward compatibility: if old format (just mean values), recompute
+            if cached and isinstance(list(cached.values())[0], (int, float)):
+                print("Detected old format, recomputing with full stats...")
+            else:
+                return cached
     
     # Compute stats from training set
     print(f"Computing user magnitude stats from training set...")
-    user_mags = defaultdict(list)
+    user_rms = defaultdict(list)
+    user_energy = defaultdict(list)
+    eps = 1e-8
     
     for batch in dm.train_dataloader():
         windows = batch["window"]  # (B, T, 3)
         cond = batch["cond"]  # (B,)
         
-        # Compute magnitude per window
-        m = torch.sqrt((windows ** 2).sum(dim=2) + 1e-8)  # (B, T)
-        mean_mag = m.mean(dim=1).numpy()  # (B,)
+        # Compute magnitude per time-step
+        m = torch.sqrt((windows ** 2).sum(dim=2) + eps)  # (B, T)
+        
+        # Compute RMS per window: sqrt(mean(m^2))
+        rms = torch.sqrt((m ** 2).mean(dim=1) + eps).numpy()  # (B,)
+        
+        # Compute energy per window: mean(m^2) (length-invariant)
+        energy = (m ** 2).mean(dim=1).numpy()  # (B,)
         
         # Group by user
         cond_np = cond.numpy() if isinstance(cond, torch.Tensor) else cond
-        for uid, mag in zip(cond_np, mean_mag):
-            user_mags[int(uid)].append(float(mag))
+        for uid, r, e in zip(cond_np, rms, energy):
+            user_rms[int(uid)].append(float(r))
+            user_energy[int(uid)].append(float(e))
     
-    # Average per user
-    user_target_mean_mag = {
-        int(uid): float(np.mean(mags))
-        for uid, mags in user_mags.items()
-    }
+    # Compute mean and std per user
+    user_stats = {}
+    for uid in user_rms.keys():
+        rms_list = user_rms[uid]
+        energy_list = user_energy[uid]
+        user_stats[int(uid)] = {
+            "mean_rms_mag": float(np.mean(rms_list)),
+            "std_rms_mag": float(np.std(rms_list)),
+            "mean_energy_mag": float(np.mean(energy_list)),
+            "std_energy_mag": float(np.std(energy_list))
+        }
     
     # Save cache
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     with open(cache_path, 'w') as f:
-        json.dump(user_target_mean_mag, f, indent=2)
+        json.dump(user_stats, f, indent=2)
     print(f"Saved user magnitude stats to {cache_path}")
     
-    return user_target_mean_mag
+    return user_stats
 
 def kl_cosine_beta(epoch, warmup_epochs, max_beta=1.0):
     if warmup_epochs <= 0:
@@ -539,10 +699,11 @@ def train_ddpm(
     realism_bad = 0
     realism_patience = DDPM_REALISM_PATIENCE
     
-    # Precompute user magnitude stats if user supervision is enabled
-    user_target_mean_mag = None
-    if DDPM_ENABLE_USER and dm is not None:
-        user_target_mean_mag = compute_user_magnitude_stats(dm, sensor_type, save_dir)
+    # Precompute user magnitude stats (RMS and energy) for user-conditioned losses
+    user_stats = None
+    if (DDPM_ENABLE_RMS and DDPM_W_RMS_USER > 0) or (DDPM_W_ENERGY_USER > 0) or (DDPM_ENABLE_USER and DDPM_W_USER > 0):
+        if dm is not None:
+            user_stats = compute_user_magnitude_stats(dm, sensor_type, save_dir)
     
     
     fixed_cond_idx = None
@@ -590,9 +751,16 @@ def train_ddpm(
         epoch_smooth = []
         epoch_jerk = []
         epoch_spec = []
-        epoch_rms = []
+        epoch_rms_user = []
+        epoch_energy_user = []
+        epoch_lf = []
         epoch_rms_pred_mean = []
         epoch_rms_real_mean = []
+        epoch_e_pred_mean = []
+        epoch_e_real_mean = []
+        epoch_lf_ratio_pred_mean = []
+        epoch_lf_ratio_real_mean = []
+        epoch_missing_user_stats = 0
         for z0, cond in train_loader:
             z0 = z0.to(DEVICE)
             cond = cond.to(DEVICE)
@@ -610,11 +778,20 @@ def train_ddpm(
             smooth_loss_val = torch.tensor(0.0, device=DEVICE)
             jerk_loss_val = torch.tensor(0.0, device=DEVICE)
             spec_loss_val = torch.tensor(0.0, device=DEVICE)
-            rms_loss_val = torch.tensor(0.0, device=DEVICE)
+            rms_user_loss_val = torch.tensor(0.0, device=DEVICE)
+            energy_user_loss_val = torch.tensor(0.0, device=DEVICE)
+            lf_loss_val = torch.tensor(0.0, device=DEVICE)
             rms_pred_mean_val = torch.tensor(0.0, device=DEVICE)
             rms_real_mean_val = torch.tensor(0.0, device=DEVICE)
+            e_pred_mean_val = torch.tensor(0.0, device=DEVICE)
+            e_real_mean_val = torch.tensor(0.0, device=DEVICE)
+            lf_ratio_pred_mean_val = torch.tensor(0.0, device=DEVICE)
+            lf_ratio_real_mean_val = torch.tensor(0.0, device=DEVICE)
             
-            if vae is not None and (DDPM_W_SMOOTH > 0 or DDPM_W_JERK > 0 or DDPM_W_SPEC > 0 or (DDPM_ENABLE_RMS and DDPM_W_RMS > 0)):
+            needs_decode = (DDPM_W_SMOOTH > 0 or DDPM_W_JERK > 0 or DDPM_W_SPEC > 0 or 
+                          (DDPM_ENABLE_RMS and DDPM_W_RMS_USER > 0) or DDPM_W_ENERGY_USER > 0 or DDPM_W_LF > 0)
+            
+            if vae is not None and needs_decode:
                 x0_pred_latent.requires_grad_(True)
                 x0_pred_windows_flat = vae.decode(x0_pred_latent)
                 x0_pred_windows = x0_pred_windows_flat.view(z0.shape[0], WINDOW_SIZE, 3)
@@ -632,21 +809,31 @@ def train_ddpm(
                         eps=DDPM_SPEC_EPS
                     )
                 
-                # RMS loss: decode z0 to get real windows for comparison
-                if DDPM_ENABLE_RMS and DDPM_W_RMS > 0:
+                # Decode z0 to get real windows for user-conditioned losses
+                x0_real_windows = None
+                if (DDPM_ENABLE_RMS and DDPM_W_RMS_USER > 0) or DDPM_W_ENERGY_USER > 0 or DDPM_W_LF > 0:
                     with torch.no_grad():
                         x0_real_windows_flat = vae.decode(z0)
                         x0_real_windows = x0_real_windows_flat.view(z0.shape[0], WINDOW_SIZE, 3)
-                    rms_loss_val = compute_rms_loss(x0_pred_windows, x0_real_windows, eps=1e-8)
-                    
-                    # Compute mean RMS values for logging
-                    eps_log = 1e-8
-                    m_pred = torch.sqrt((x0_pred_windows ** 2).sum(dim=2) + eps_log)
-                    m_real = torch.sqrt((x0_real_windows ** 2).sum(dim=2) + eps_log)
-                    rms_pred = torch.sqrt((m_pred ** 2).mean(dim=1) + eps_log)
-                    rms_real = torch.sqrt((m_real ** 2).mean(dim=1) + eps_log)
-                    rms_pred_mean_val = rms_pred.mean()
-                    rms_real_mean_val = rms_real.mean()
+                
+                # User-conditioned RMS loss
+                if DDPM_ENABLE_RMS and DDPM_W_RMS_USER > 0 and user_stats is not None:
+                    rms_user_loss_val, rms_pred_mean_val, rms_real_mean_val, missing_count = compute_rms_user_loss(
+                        x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8
+                    )
+                    epoch_missing_user_stats += missing_count
+                
+                # User-conditioned energy loss
+                if DDPM_W_ENERGY_USER > 0 and user_stats is not None:
+                    energy_user_loss_val, e_pred_mean_val, e_real_mean_val = compute_energy_user_loss(
+                        x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8
+                    )
+                
+                # Low-frequency energy matching loss
+                if DDPM_W_LF > 0:
+                    lf_loss_val, lf_ratio_pred_mean_val, lf_ratio_real_mean_val = compute_lf_energy_loss(
+                        x0_pred_windows, x0_real_windows, fs_hz=DDPM_SAMPLING_RATE_HZ, cutoff_hz=5.0, eps=1e-8
+                    )
             
             t0 = torch.zeros_like(t)
             noise0 = torch.randn_like(z0)
@@ -667,7 +854,9 @@ def train_ddpm(
                 + DDPM_W_SMOOTH * smooth_loss_val
                 + DDPM_W_JERK * jerk_loss_val
                 + DDPM_W_SPEC * spec_loss_val
-                + (DDPM_W_RMS * rms_loss_val if DDPM_ENABLE_RMS else 0.0)
+                + (DDPM_W_RMS_USER * rms_user_loss_val if DDPM_ENABLE_RMS else 0.0)
+                + DDPM_W_ENERGY_USER * energy_user_loss_val
+                + DDPM_W_LF * lf_loss_val
             )
             
             opt.zero_grad()
@@ -682,18 +871,30 @@ def train_ddpm(
             epoch_smooth.append(smooth_loss_val.item() if isinstance(smooth_loss_val, torch.Tensor) else smooth_loss_val)
             epoch_jerk.append(jerk_loss_val.item() if isinstance(jerk_loss_val, torch.Tensor) else jerk_loss_val)
             epoch_spec.append(spec_loss_val.item() if isinstance(spec_loss_val, torch.Tensor) else spec_loss_val)
-            epoch_rms.append(rms_loss_val.item() if isinstance(rms_loss_val, torch.Tensor) else rms_loss_val)
+            epoch_rms_user.append(rms_user_loss_val.item() if isinstance(rms_user_loss_val, torch.Tensor) else rms_user_loss_val)
+            epoch_energy_user.append(energy_user_loss_val.item() if isinstance(energy_user_loss_val, torch.Tensor) else energy_user_loss_val)
+            epoch_lf.append(lf_loss_val.item() if isinstance(lf_loss_val, torch.Tensor) else lf_loss_val)
             epoch_rms_pred_mean.append(rms_pred_mean_val.item() if isinstance(rms_pred_mean_val, torch.Tensor) else rms_pred_mean_val)
             epoch_rms_real_mean.append(rms_real_mean_val.item() if isinstance(rms_real_mean_val, torch.Tensor) else rms_real_mean_val)
+            epoch_e_pred_mean.append(e_pred_mean_val.item() if isinstance(e_pred_mean_val, torch.Tensor) else e_pred_mean_val)
+            epoch_e_real_mean.append(e_real_mean_val.item() if isinstance(e_real_mean_val, torch.Tensor) else e_real_mean_val)
+            epoch_lf_ratio_pred_mean.append(lf_ratio_pred_mean_val.item() if isinstance(lf_ratio_pred_mean_val, torch.Tensor) else lf_ratio_pred_mean_val)
+            epoch_lf_ratio_real_mean.append(lf_ratio_real_mean_val.item() if isinstance(lf_ratio_real_mean_val, torch.Tensor) else lf_ratio_real_mean_val)
         tr_total = float(np.mean(epoch_total))
         tr_mse = float(np.mean(epoch_mse))
         tr_var = float(np.mean(epoch_var_loss))
         tr_smooth = float(np.mean(epoch_smooth))
         tr_jerk = float(np.mean(epoch_jerk))
         tr_spec = float(np.mean(epoch_spec))
-        tr_rms = float(np.mean(epoch_rms))
+        tr_rms_user = float(np.mean(epoch_rms_user))
+        tr_energy_user = float(np.mean(epoch_energy_user))
+        tr_lf = float(np.mean(epoch_lf))
         tr_rms_pred_mean = float(np.mean(epoch_rms_pred_mean))
         tr_rms_real_mean = float(np.mean(epoch_rms_real_mean))
+        tr_e_pred_mean = float(np.mean(epoch_e_pred_mean))
+        tr_e_real_mean = float(np.mean(epoch_e_real_mean))
+        tr_lf_ratio_pred_mean = float(np.mean(epoch_lf_ratio_pred_mean))
+        tr_lf_ratio_real_mean = float(np.mean(epoch_lf_ratio_real_mean))
         history["train_total"] = history.get("train_total", [])
         history["train_total"].append(tr_total)
         history["train_mse"] = history.get("train_mse", [])
@@ -706,12 +907,24 @@ def train_ddpm(
         history["train_jerk"].append(tr_jerk)
         history["train_spec"] = history.get("train_spec", [])
         history["train_spec"].append(tr_spec)
-        history["train_rms"] = history.get("train_rms", [])
-        history["train_rms"].append(tr_rms)
+        history["train_rms_user"] = history.get("train_rms_user", [])
+        history["train_rms_user"].append(tr_rms_user)
+        history["train_energy_user"] = history.get("train_energy_user", [])
+        history["train_energy_user"].append(tr_energy_user)
+        history["train_lf"] = history.get("train_lf", [])
+        history["train_lf"].append(tr_lf)
         history["train_rms_pred_mean"] = history.get("train_rms_pred_mean", [])
         history["train_rms_pred_mean"].append(tr_rms_pred_mean)
         history["train_rms_real_mean"] = history.get("train_rms_real_mean", [])
         history["train_rms_real_mean"].append(tr_rms_real_mean)
+        history["train_e_pred_mean"] = history.get("train_e_pred_mean", [])
+        history["train_e_pred_mean"].append(tr_e_pred_mean)
+        history["train_e_real_mean"] = history.get("train_e_real_mean", [])
+        history["train_e_real_mean"].append(tr_e_real_mean)
+        history["train_lf_ratio_pred_mean"] = history.get("train_lf_ratio_pred_mean", [])
+        history["train_lf_ratio_pred_mean"].append(tr_lf_ratio_pred_mean)
+        history["train_lf_ratio_real_mean"] = history.get("train_lf_ratio_real_mean", [])
+        history["train_lf_ratio_real_mean"].append(tr_lf_ratio_real_mean)
 
         model.eval()
         v_total = []
@@ -756,13 +969,18 @@ def train_ddpm(
         history["val_var"] = history.get("val_var", [])
         history["val_var"].append(va_var)
 
+        missing_stats_msg = f" | missing_user_stats {epoch_missing_user_stats}" if epoch_missing_user_stats > 0 else ""
         print(
             f"[DDPM] epoch {epoch+1:03d} | "
             f"train_total {tr_total:.4f} | val_total {va_total:.4f} | "
             f"train_mse {tr_mse:.4f} | val_mse {va_mse:.4f} | "
             f"train_var {tr_var:.6f} | val_var {va_var:.6f} | "
             f"train_smooth {tr_smooth:.6f} | train_jerk {tr_jerk:.6f} | train_spec {tr_spec:.6f} | "
-            f"train_rms {tr_rms:.6f} | rms_pred_mean {tr_rms_pred_mean:.4f} | rms_real_mean {tr_rms_real_mean:.4f}"
+            f"train_rms_user {tr_rms_user:.6f} | train_energy_user {tr_energy_user:.6f} | train_lf {tr_lf:.6f} | "
+            f"rms_pred_mean {tr_rms_pred_mean:.4f} | rms_real_mean {tr_rms_real_mean:.4f} | "
+            f"e_pred_mean {tr_e_pred_mean:.4f} | e_real_mean {tr_e_real_mean:.4f} | "
+            f"lf_ratio_pred_mean {tr_lf_ratio_pred_mean:.4f} | lf_ratio_real_mean {tr_lf_ratio_real_mean:.4f}"
+            f"{missing_stats_msg}"
         )
         
         realism_metrics = None
