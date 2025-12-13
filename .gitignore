@@ -177,9 +177,9 @@ synthetic_data/
 synthetic/
 generated/
 
-# Evaluation outputs
+# Evaluation outputs (but not source code)
 evaluation_results/
-evaluation/
+checkpoints/*/evaluation/
 eda/
 
 # Temporary files
