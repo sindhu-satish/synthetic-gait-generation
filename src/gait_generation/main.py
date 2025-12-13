@@ -14,6 +14,7 @@ if __name__ == "__main__":
     parser.add_argument("--split-mode", type=str, default="window", choices=["window", "user_disjoint"], help="Classifier split mode: 'window' (window-level) or 'user_disjoint' (user-level)")
     parser.add_argument("--per-user-k", type=int, default=50, help="Number of windows per user for matched sampling (default: 50)")
     parser.add_argument("--eval-seed", type=int, default=42, help="Random seed for evaluation reproducibility (default: 42)")
+    parser.add_argument("--sensors", type=str, nargs="+", choices=["accelerometer", "gyroscope", "both"], default=["both"], help="Which sensors to train: 'accelerometer', 'gyroscope', or 'both' (default: both). Can specify multiple, e.g., --sensors accelerometer gyroscope")
     parser.add_argument("mode", nargs="?", default="full", 
                        help="Pipeline mode: 'full' (default) or 'ablations'")
     
@@ -26,6 +27,18 @@ if __name__ == "__main__":
         main()
     else:
         from .run_full_pipeline import main
+        # Normalize sensor selection
+        sensors_to_run = []
+        if "both" in args.sensors:
+            sensors_to_run = ["Accelerometer", "Gyroscope"]
+        else:
+            # Convert to proper case: "accelerometer" -> "Accelerometer", "gyroscope" -> "Gyroscope"
+            sensor_map = {"accelerometer": "Accelerometer", "gyroscope": "Gyroscope"}
+            sensors_to_run = [sensor_map.get(s.lower(), s.capitalize()) for s in args.sensors if s.lower() in sensor_map]
+            if not sensors_to_run:
+                print(f"Warning: No valid sensors specified. Using both sensors.")
+                sensors_to_run = ["Accelerometer", "Gyroscope"]
+        
         main(
             skip_eda=args.skip_eda,
             post_fft=args.post_fft,
@@ -37,5 +50,6 @@ if __name__ == "__main__":
             split_mode=args.split_mode,
             per_user_k=args.per_user_k,
             eval_seed=args.eval_seed,
+            sensors=sensors_to_run,
         )
 

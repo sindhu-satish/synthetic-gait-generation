@@ -274,6 +274,7 @@ def main(
     split_mode: str = "window",
     per_user_k: int = 50,
     eval_seed: int = 42,
+    sensors: list = None,
 ):
     set_seed(SEED)
     
@@ -287,6 +288,15 @@ def main(
     per_user_k = per_user_k if per_user_k is not None else EVAL_PER_USER_K
     eval_seed = eval_seed if eval_seed is not None else EVAL_SEED
     
+    if sensors is None:
+        sensors_to_process = list(SENSOR_TYPES)
+    else:
+        valid_sensors = set(SENSOR_TYPES)
+        sensors_to_process = [s for s in sensors if s in valid_sensors]
+        if not sensors_to_process:
+            print(f"Warning: No valid sensors found in {sensors}. Using all sensors.")
+            sensors_to_process = list(SENSOR_TYPES)
+    
     post_cfg = PostprocessConfig(
         enable_fft_lowpass=bool(post_fft),
         fft_cutoff_hz=float(POST_FFT_CUTOFF_HZ if fft_fc is None else fft_fc),
@@ -295,11 +305,13 @@ def main(
         savgol_polyorder=int(POST_SAVGOL_POLYORDER if savgol_poly is None else savgol_poly),
     )
     
-    for sensor_type in SENSOR_TYPES:
+    print(f"\n{'='*60}")
+    print(f"Processing sensors: {', '.join(sensors_to_process)}")
+    print(f"{'='*60}\n")
+    
+    for sensor_type in sensors_to_process:
         vae, dm, save_dir = train_windowed_vae(sensor_type, SAVE_DIR)
         ddpm, unet = train_ddpm_model(sensor_type, vae, dm, save_dir)
-        
-        # Get matched samples for evaluation
         real_windows, real_user_ids, synth_windows, synth_user_ids = get_matched_real_and_synth_windows(
             sensor_type=sensor_type,
             split="test",
