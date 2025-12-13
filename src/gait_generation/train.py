@@ -28,6 +28,92 @@ from .metrics import compute_realism_metrics
 
 _spectral_loss_logged = False
 
+_stats_key_format = None
+_stats_key_decoder = None
+
+def detect_stats_key_format(user_stats, dm=None):
+    """
+    Detect the format of keys in user_stats dict.
+    Returns: ('int', 'numeric_string', or 'raw_id'), decoder_func or None
+    
+    Args:
+        user_stats: dict with user stats
+        dm: Optional data module (for raw_id mode decoder)
+    """
+    global _stats_key_format, _stats_key_decoder
+    
+    if _stats_key_format is not None:
+        return _stats_key_format, _stats_key_decoder
+    
+    # Get sample of keys (excluding __global__)
+    sample_keys = [k for k in user_stats.keys() if k != "__global__"][:50]
+    if not sample_keys:
+        _stats_key_format = 'int'
+        _stats_key_decoder = None
+        return _stats_key_format, _stats_key_decoder
+    
+    # Check if all are numeric strings
+    if all(isinstance(k, str) and k.isdigit() for k in sample_keys):
+        _stats_key_format = 'numeric_string'
+        _stats_key_decoder = None
+        return _stats_key_format, _stats_key_decoder
+    
+    # Check if all are ints
+    if all(isinstance(k, int) for k in sample_keys):
+        _stats_key_format = 'int'
+        _stats_key_decoder = None
+        return _stats_key_format, _stats_key_decoder
+    
+    # Otherwise, assume raw user IDs (non-numeric strings or mixed)
+    # Need decoder from cond_idx to user_id
+    if dm is not None and hasattr(dm, 'rev_cond_map'):
+        _stats_key_format = 'raw_id'
+        _stats_key_decoder = lambda idx: dm.rev_cond_map.get(int(idx), None)
+        return _stats_key_format, _stats_key_decoder
+    else:
+        raise ValueError(
+            "user_mag_stats.json keys are raw IDs but cond_idx is numeric; "
+            "need idx_to_user_id mapping from dataset (dm.rev_cond_map)"
+        )
+
+def stats_key_from_cond(cond_value, user_stats, decoder=None, dm=None):
+    """
+    Convert cond_value to the correct key format for user_stats lookup.
+    
+    Args:
+        cond_value: cond_idx value (int or tensor)
+        user_stats: dict with user stats
+        decoder: Optional function to decode cond_idx to user_id (for raw_id mode)
+        dm: Optional data module (for auto-detecting decoder)
+    
+    Returns:
+        Key to use for user_stats lookup
+    """
+    global _stats_key_format, _stats_key_decoder
+    
+    if _stats_key_format is None:
+        # If decoder is provided and is a callable, we can't use it for detection
+        # We need dm for detection. If not available, try to detect without decoder.
+        detect_stats_key_format(user_stats, dm)
+    
+    cond_int = int(cond_value) if not isinstance(cond_value, (int, np.integer)) else cond_value
+    
+    if _stats_key_format == 'numeric_string':
+        return str(cond_int)
+    elif _stats_key_format == 'int':
+        return cond_int
+    elif _stats_key_format == 'raw_id':
+        if decoder is None:
+            decoder = _stats_key_decoder
+        if decoder is None:
+            raise ValueError("raw_id mode requires decoder function")
+        user_id = decoder(cond_int)
+        if user_id is None:
+            return None
+        return user_id
+    else:
+        raise ValueError(f"Unknown stats_key_format: {_stats_key_format}")
+
 def compute_smoothness_loss_ddpm(x0_pred_windows):
     """
     Smoothness loss on first differences (targets jerk spikes).
@@ -149,7 +235,7 @@ def compute_spectral_loss_mag(x0_pred_windows, fs_hz, cutoff_hz, fmin_hz, eps):
     
     return hf_ratios_mag.mean()  # scalar
 
-def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8):
+def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8, decoder=None, dm=None):
     """
     User-conditioned RMS preservation loss using z-scores.
     x0_pred_windows: (B, T, 3) predicted windows
@@ -157,6 +243,8 @@ def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, ep
     cond: (B,) conditioning indices (user IDs)
     user_stats: dict mapping user_id -> {mean_rms_mag, std_rms_mag, ...}
     eps: Small epsilon for numerical stability
+    decoder: Optional function to decode cond_idx to user_id (for raw_id mode)
+    dm: Optional data module (for auto-detecting decoder)
     Returns: Mean squared difference of standardized RMS values, and raw RMS means for logging
     """
     # Compute magnitude for both
@@ -183,11 +271,16 @@ def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, ep
     z_rms_real = []
     missing_count = 0
     
+    # Get decoder if needed (for raw_id mode)
+    decoder = None
+    if _stats_key_format == 'raw_id' and hasattr(user_stats, '_decoder'):
+        decoder = user_stats._decoder
+    
     for i, uid in enumerate(cond_np):
-        uid_int = int(uid)
-        if uid_int in user_stats and uid_int != "__global__":
-            mu = user_stats[uid_int]["mean_rms_mag"]
-            sigma = max(user_stats[uid_int]["std_rms_mag"], 1e-3)
+        stats_key = stats_key_from_cond(uid, user_stats, decoder, dm=dm)
+        if stats_key is not None and stats_key in user_stats and stats_key != "__global__":
+            mu = user_stats[stats_key]["mean_rms_mag"]
+            sigma = max(user_stats[stats_key]["std_rms_mag"], 1e-3)
         else:
             mu = all_rms_mean
             sigma = all_rms_std
@@ -203,7 +296,7 @@ def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, ep
     loss = ((z_rms_pred - z_rms_real) ** 2).mean()
     return loss, rms_pred.mean(), rms_real.mean(), missing_count
 
-def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8):
+def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8, decoder=None, dm=None):
     """
     User-conditioned energy preservation loss using z-scores.
     x0_pred_windows: (B, T, 3) predicted windows
@@ -211,6 +304,8 @@ def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats,
     cond: (B,) conditioning indices (user IDs)
     user_stats: dict mapping user_id -> {mean_energy_mag, std_energy_mag, ...}
     eps: Small epsilon for numerical stability
+    decoder: Optional function to decode cond_idx to user_id (for raw_id mode)
+    dm: Optional data module (for auto-detecting decoder)
     Returns: Mean squared difference of standardized energy values, and raw energy means for logging
     """
     # Compute magnitude for both
@@ -236,11 +331,16 @@ def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats,
     z_e_pred = []
     z_e_real = []
     
+    # Get decoder if needed (for raw_id mode)
+    decoder = None
+    if _stats_key_format == 'raw_id' and hasattr(user_stats, '_decoder'):
+        decoder = user_stats._decoder
+    
     for i, uid in enumerate(cond_np):
-        uid_int = int(uid)
-        if uid_int in user_stats and uid_int != "__global__":
-            mu = user_stats[uid_int]["mean_energy_mag"]
-            sigma = max(user_stats[uid_int]["std_energy_mag"], 1e-3)
+        stats_key = stats_key_from_cond(uid, user_stats, decoder, dm=dm)
+        if stats_key is not None and stats_key in user_stats and stats_key != "__global__":
+            mu = user_stats[stats_key]["mean_energy_mag"]
+            sigma = max(user_stats[stats_key]["std_energy_mag"], 1e-3)
         else:
             mu = all_e_mean
             sigma = all_e_std
@@ -394,6 +494,10 @@ def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir
     Precompute per-user target RMS and energy stats from training set.
     Returns: dict mapping user_id -> {mean_rms_mag, std_rms_mag, mean_energy_mag, std_energy_mag}
     """
+    global _stats_key_format, _stats_key_decoder
+    _stats_key_format = None
+    _stats_key_decoder = None
+    
     if cache_dir is None:
         cache_dir = SAVE_DIR
     cache_path = os.path.join(cache_dir, f"{sensor_type.lower() if sensor_type else 'gait'}", "user_mag_stats.json")
@@ -407,6 +511,20 @@ def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir
             if cached and isinstance(list(cached.values())[0], (int, float)):
                 print("Detected old format, recomputing with full stats...")
             else:
+                # Diagnose key format
+                sample_keys = [k for k in cached.keys() if k != "__global__"][:5]
+                print(f"\n[Stats Key Format Diagnosis]")
+                print(f"  Total keys: {len(cached)}")
+                print(f"  Sample keys: {sample_keys}")
+                print(f"  Key types: {[type(k).__name__ for k in sample_keys]}")
+                
+                # Detect format (pass dm for decoder if needed)
+                format_type, decoder = detect_stats_key_format(cached, dm)
+                print(f"  Detected format: {format_type}")
+                if decoder is not None:
+                    print(f"  Using decoder: Yes")
+                print()
+                
                 return cached
     
     # Compute stats from training set
@@ -784,9 +902,64 @@ def train_ddpm(
         epoch_lf_ratio_pred_mean = []
         epoch_lf_ratio_real_mean = []
         epoch_missing_user_stats = 0
-        for z0, cond in train_loader:
+        epoch_total_samples = 0
+        epoch_unique_users_seen = set()
+        epoch_unique_stats_keys_found = set()
+        _first_batch_diagnosed = False
+        
+        for batch_idx, (z0, cond) in enumerate(train_loader):
             z0 = z0.to(DEVICE)
             cond = cond.to(DEVICE)
+            
+            # One-time diagnostics for first batch of first epoch
+            if epoch == 0 and batch_idx == 0 and user_stats is not None:
+                cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
+                cond_ints = [int(c) for c in cond_np[:20]]
+                print(f"\n[First Batch Diagnostics - Epoch 1, Batch 0]")
+                print(f"  First 20 cond_idx values: {cond_ints}")
+                print(f"  cond_idx type: {type(cond_np[0])}")
+                print(f"  cond_idx min: {int(cond_np.min())}, max: {int(cond_np.max())}")
+                print(f"  Unique cond_idx in batch: {len(np.unique(cond_np))}")
+                
+                # Test lookup with different key formats
+                decoder = None
+                if _stats_key_format == 'raw_id' and hasattr(dm, 'rev_cond_map'):
+                    decoder = lambda idx: dm.rev_cond_map.get(int(idx), None)
+                
+                hits_int = 0
+                hits_str = 0
+                hits_mapped = 0
+                for c in cond_ints:
+                    if c in user_stats:
+                        hits_int += 1
+                    if str(c) in user_stats:
+                        hits_str += 1
+                    stats_key = stats_key_from_cond(c, user_stats, decoder, dm=dm)
+                    if stats_key is not None and stats_key in user_stats:
+                        hits_mapped += 1
+                
+                print(f"  Lookup hits (int keys): {hits_int}/20")
+                print(f"  Lookup hits (str keys): {hits_str}/20")
+                print(f"  Lookup hits (mapped keys): {hits_mapped}/20")
+                print(f"  Using format: {_stats_key_format}")
+                print()
+                _first_batch_diagnosed = True
+            
+            # Coverage report for first 50 batches of first epoch
+            if epoch == 0 and batch_idx < 50 and user_stats is not None:
+                cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
+                unique_cond_in_batch = np.unique(cond_np)
+                epoch_unique_users_seen.update(unique_cond_in_batch)
+                
+                decoder = None
+                if _stats_key_format == 'raw_id' and hasattr(dm, 'rev_cond_map'):
+                    decoder = lambda idx: dm.rev_cond_map.get(int(idx), None)
+                
+                for c in unique_cond_in_batch:
+                    stats_key = stats_key_from_cond(c, user_stats, decoder, dm=dm)
+                    if stats_key is not None and stats_key in user_stats:
+                        epoch_unique_stats_keys_found.add(stats_key)
+            
             t = torch.randint(0, ddpm.num_timesteps, (z0.shape[0],), device=DEVICE).long()
             noise = torch.randn_like(z0)
             zt = ddpm.q_sample(z0, t, noise)
@@ -841,15 +1014,22 @@ def train_ddpm(
                 
                 # User-conditioned RMS loss
                 if DDPM_ENABLE_RMS and DDPM_W_RMS_USER > 0 and user_stats is not None:
+                    decoder = None
+                    if _stats_key_format == 'raw_id' and hasattr(dm, 'rev_cond_map'):
+                        decoder = lambda idx: dm.rev_cond_map.get(int(idx), None)
                     rms_user_loss_val, rms_pred_mean_val, rms_real_mean_val, missing_count = compute_rms_user_loss(
-                        x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8
+                        x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8, decoder=decoder, dm=dm
                     )
                     epoch_missing_user_stats += missing_count
+                    epoch_total_samples += z0.shape[0]
                 
                 # User-conditioned energy loss
                 if DDPM_W_ENERGY_USER > 0 and user_stats is not None:
+                    decoder = None
+                    if _stats_key_format == 'raw_id' and hasattr(dm, 'rev_cond_map'):
+                        decoder = lambda idx: dm.rev_cond_map.get(int(idx), None)
                     energy_user_loss_val, e_pred_mean_val, e_real_mean_val = compute_energy_user_loss(
-                        x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8
+                        x0_pred_windows, x0_real_windows, cond, user_stats, eps=1e-8, decoder=decoder, dm=dm
                     )
                 
                 # Low-frequency energy matching loss
@@ -992,7 +1172,19 @@ def train_ddpm(
         history["val_var"] = history.get("val_var", [])
         history["val_var"].append(va_var)
 
-        missing_stats_msg = f" | missing_user_stats {epoch_missing_user_stats}" if epoch_missing_user_stats > 0 else ""
+        # Coverage report for first epoch
+        if epoch == 0 and user_stats is not None and epoch_total_samples > 0:
+            coverage_pct = (1.0 - epoch_missing_user_stats / epoch_total_samples) * 100.0
+            print(f"\n[Epoch 1 Coverage Report]")
+            print(f"  Stats key format: {_stats_key_format}")
+            print(f"  Unique users seen: {len(epoch_unique_users_seen)}")
+            print(f"  Unique stats keys found: {len(epoch_unique_stats_keys_found)}")
+            print(f"  Missing stats: {epoch_missing_user_stats} / {epoch_total_samples} ({100.0 - coverage_pct:.2f}%)")
+            print(f"  Coverage: {coverage_pct:.2f}%")
+            print()
+        
+        missing_stats_pct = (epoch_missing_user_stats / epoch_total_samples * 100.0) if epoch_total_samples > 0 else 0.0
+        missing_stats_msg = f" | missing_user_stats {epoch_missing_user_stats} ({missing_stats_pct:.2f}%)" if epoch_missing_user_stats > 0 else ""
         print(
             f"[DDPM] epoch {epoch+1:03d} | "
             f"train_total {tr_total:.4f} | val_total {va_total:.4f} | "
