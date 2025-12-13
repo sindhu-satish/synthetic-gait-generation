@@ -102,6 +102,10 @@ POST_SAVGOL_POLYORDER = 3
 SEED = 42
 SAVE_DIR = "checkpoints/gait"
 
+EVAL_SPLIT_MODE = "window"  # "window" or "user_disjoint"
+EVAL_PER_USER_K = 50 
+EVAL_SEED = 42  
+
 if torch.cuda.is_available():
     DEVICE = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

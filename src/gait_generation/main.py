@@ -11,6 +11,9 @@ if __name__ == "__main__":
     parser.add_argument("--fft-fc", type=float, default=None, help="FFT low-pass cutoff frequency in Hz (default: config.POST_FFT_CUTOFF_HZ)")
     parser.add_argument("--savgol-window", type=int, default=None, help="Savitzky–Golay window length (odd; default: config.POST_SAVGOL_WINDOW_LENGTH)")
     parser.add_argument("--savgol-poly", type=int, default=None, help="Savitzky–Golay polynomial order (default: config.POST_SAVGOL_POLYORDER)")
+    parser.add_argument("--split-mode", type=str, default="window", choices=["window", "user_disjoint"], help="Classifier split mode: 'window' (window-level) or 'user_disjoint' (user-level)")
+    parser.add_argument("--per-user-k", type=int, default=50, help="Number of windows per user for matched sampling (default: 50)")
+    parser.add_argument("--eval-seed", type=int, default=42, help="Random seed for evaluation reproducibility (default: 42)")
     parser.add_argument("mode", nargs="?", default="full", 
                        help="Pipeline mode: 'full' (default) or 'ablations'")
     
@@ -31,5 +34,8 @@ if __name__ == "__main__":
             fft_fc=args.fft_fc,
             savgol_window=args.savgol_window,
             savgol_poly=args.savgol_poly,
+            split_mode=args.split_mode,
+            per_user_k=args.per_user_k,
+            eval_seed=args.eval_seed,
         )
 

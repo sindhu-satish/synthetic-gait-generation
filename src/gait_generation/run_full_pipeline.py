@@ -16,6 +16,10 @@ from .eda.gait_signal_analysis import load_windows_from_data, run_eda
 from .evaluation.real_vs_synthetic_classifier import evaluate_real_vs_synthetic
 from .evaluation.statistical_tests import run_statistical_tests
 from .evaluation.augmentation_effectiveness import run_augmentation_experiment
+from .evaluation.eval_utils import (
+    get_matched_real_and_synth_windows,
+    save_matched_sampling_manifest
+)
 from .postprocess import PostprocessConfig, postprocess_windows
 
 def train_windowed_vae(sensor_type: str, save_dir: str = None):
@@ -105,51 +109,35 @@ def train_ddpm_model(sensor_type: str, vae, dm, save_dir: str):
     unet.eval()
     return ddpm, unet
 
-def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm, post_cfg: PostprocessConfig, fs_hz: float):
+def run_eda_analysis(
+    sensor_type: str,
+    dm,
+    save_dir: str,
+    vae,
+    ddpm,
+    post_cfg: PostprocessConfig,
+    fs_hz: float,
+    per_user_k: int = 50,
+    eval_seed: int = 42
+):
     print(f"\n{'='*60}")
     print(f"Running EDA for {sensor_type}")
     print(f"{'='*60}\n")
     
-    real_windows, real_user_ids = load_windows_from_data(dm, sensor_type)
+    # Use matched sampling for EDA
+    from .config import EVAL_PER_USER_K, EVAL_SEED
+    per_user_k = per_user_k or EVAL_PER_USER_K
+    eval_seed = eval_seed or EVAL_SEED
     
-    synth_df = sample_synthetic(len(real_windows), ddpm, vae, dm)
-    
-    synth_windows = []
-    synth_user_ids = []
-    
-    
-    unique_real_user_ids = np.unique(real_user_ids)
-    
-    for user_id in unique_real_user_ids[:20]:
-        
-        user_id_str = str(user_id)
-        user_synth = synth_df[synth_df["__user_id__"] == user_id_str]
-        
-        if len(user_synth) >= WINDOW_SIZE:
-            user_data = user_synth[["Xvalue", "Yvalue", "Zvalue"]].values
-            for i in range(0, len(user_data) - WINDOW_SIZE + 1, WINDOW_SIZE):
-                synth_windows.append(user_data[i:i+WINDOW_SIZE])
-                synth_user_ids.append(user_id)
-    
-    
-    if len(synth_windows) < len(real_windows) and len(synth_df) >= WINDOW_SIZE:
-        print(f"Warning: Only found {len(synth_windows)} matching synthetic windows, using all available synthetic data")
-        all_synth_data = synth_df[["Xvalue", "Yvalue", "Zvalue"]].values
-        for i in range(0, len(all_synth_data) - WINDOW_SIZE + 1, WINDOW_SIZE):
-            if len(synth_windows) >= len(real_windows):
-                break
-            synth_windows.append(all_synth_data[i:i+WINDOW_SIZE])
-            
-            synth_user_id = synth_df.iloc[i]["__user_id__"]
-            
-            try:
-                
-                synth_user_ids.append(int(synth_user_id) if synth_user_id.isdigit() else synth_user_id)
-            except:
-                synth_user_ids.append(synth_user_id)
-    
-    synth_windows = np.array(synth_windows[:len(real_windows)]) if len(synth_windows) > 0 else np.array([])
-    synth_user_ids = np.array(synth_user_ids[:len(real_windows)]) if len(synth_user_ids) > 0 else np.array([])
+    real_windows, real_user_ids, synth_windows, synth_user_ids = get_matched_real_and_synth_windows(
+        sensor_type=sensor_type,
+        split="test",
+        per_user_k=per_user_k,
+        ddpm=ddpm,
+        vae=vae,
+        dm=dm,
+        eval_seed=eval_seed
+    )
     
     synth_windows_post = None
     if synth_windows.size > 0 and (post_cfg.enable_fft_lowpass or post_cfg.enable_savgol):
@@ -166,7 +154,18 @@ def run_eda_analysis(sensor_type: str, dm, save_dir: str, vae, ddpm, post_cfg: P
         synth_windows_post=synth_windows_post,
     )
 
-def run_realism_evaluation(sensor_type: str, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir: str, post_cfg: PostprocessConfig, fs_hz: float):
+def run_realism_evaluation(
+    sensor_type: str,
+    ddpm,
+    vae,
+    dm,
+    save_dir: str,
+    post_cfg: PostprocessConfig,
+    fs_hz: float,
+    split_mode: str = "window",
+    per_user_k: int = 50,
+    eval_seed: int = 42
+):
     print(f"\n{'='*60}")
     print(f"Running Realism Evaluation for {sensor_type}")
     print(f"{'='*60}\n")
@@ -174,21 +173,70 @@ def run_realism_evaluation(sensor_type: str, real_windows, real_user_ids, synth_
     eval_save_dir = os.path.join(save_dir, "evaluation")
     os.makedirs(eval_save_dir, exist_ok=True)
     
+    # Get matched real and synthetic windows using per-user sampling
+    from .config import EVAL_PER_USER_K, EVAL_SEED, EVAL_SPLIT_MODE
+    per_user_k = per_user_k or EVAL_PER_USER_K
+    eval_seed = eval_seed or EVAL_SEED
     
+    real_windows, real_user_ids, synth_windows, synth_user_ids = get_matched_real_and_synth_windows(
+        sensor_type=sensor_type,
+        split="test",
+        per_user_k=per_user_k,
+        ddpm=ddpm,
+        vae=vae,
+        dm=dm,
+        eval_seed=eval_seed
+    )
+    
+    # Save matched sampling manifest
+    unique_users = len(np.unique(real_user_ids))
+    save_matched_sampling_manifest(
+        eval_save_dir,
+        sensor_type,
+        unique_users,
+        per_user_k,
+        eval_seed,
+        real_user_ids,
+        synth_user_ids,
+        split="test"
+    )
+    
+    # Evaluate classifier with both split modes
     raw_dir = os.path.join(eval_save_dir, "raw")
-    classifier_results = evaluate_real_vs_synthetic(real_windows, synth_windows, sensor_type, raw_dir)
+    os.makedirs(raw_dir, exist_ok=True)
+    
+    # Window split (default)
+    classifier_results_window = evaluate_real_vs_synthetic(
+        real_windows, synth_windows, sensor_type, raw_dir,
+        seed=eval_seed, split_mode="window",
+        real_user_ids=real_user_ids, synth_user_ids=synth_user_ids
+    )
+    
+    # User-disjoint split
+    classifier_results_user_disjoint = evaluate_real_vs_synthetic(
+        real_windows, synth_windows, sensor_type, raw_dir,
+        seed=eval_seed, split_mode="user_disjoint",
+        real_user_ids=real_user_ids, synth_user_ids=synth_user_ids
+    )
+    
     stats_results = run_statistical_tests(real_windows, synth_windows, sensor_type, raw_dir)
-
 
     if synth_windows is not None and len(synth_windows) > 0 and (post_cfg.enable_fft_lowpass or post_cfg.enable_savgol):
         synth_post, _ = postprocess_windows(
             synth_windows, fs=fs_hz, config=post_cfg, log_prefix=f"[{sensor_type}][Eval]"
         )
         post_dir = os.path.join(eval_save_dir, "postprocessed")
-        _ = evaluate_real_vs_synthetic(real_windows, synth_post, sensor_type, post_dir)
+        os.makedirs(post_dir, exist_ok=True)
+        
+        # Run classifier on postprocessed data (window split only for postprocessed)
+        _ = evaluate_real_vs_synthetic(
+            real_windows, synth_post, sensor_type, post_dir,
+            seed=eval_seed, split_mode="window",
+            real_user_ids=real_user_ids, synth_user_ids=synth_user_ids
+        )
         _ = run_statistical_tests(real_windows, synth_post, sensor_type, post_dir)
     
-    return classifier_results, stats_results
+    return classifier_results_window, classifier_results_user_disjoint, stats_results
 
 def run_augmentation_experiment_wrapper(sensor_type: str, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir: str, post_cfg: PostprocessConfig, fs_hz: float):
     print(f"\n{'='*60}")
@@ -223,13 +271,22 @@ def main(
     fft_fc: float | None = None,
     savgol_window: int | None = None,
     savgol_poly: int | None = None,
+    split_mode: str = "window",
+    per_user_k: int = 50,
+    eval_seed: int = 42,
 ):
     set_seed(SEED)
     
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    from .config import IMU_FS_HZ, POST_FFT_CUTOFF_HZ, POST_SAVGOL_WINDOW_LENGTH, POST_SAVGOL_POLYORDER
+    from .config import (
+        IMU_FS_HZ, POST_FFT_CUTOFF_HZ, POST_SAVGOL_WINDOW_LENGTH, POST_SAVGOL_POLYORDER,
+        EVAL_PER_USER_K, EVAL_SEED
+    )
     fs_hz = float(IMU_FS_HZ if fs is None else fs)
+    per_user_k = per_user_k if per_user_k is not None else EVAL_PER_USER_K
+    eval_seed = eval_seed if eval_seed is not None else EVAL_SEED
+    
     post_cfg = PostprocessConfig(
         enable_fft_lowpass=bool(post_fft),
         fft_cutoff_hz=float(POST_FFT_CUTOFF_HZ if fft_fc is None else fft_fc),
@@ -242,52 +299,39 @@ def main(
         vae, dm, save_dir = train_windowed_vae(sensor_type, SAVE_DIR)
         ddpm, unet = train_ddpm_model(sensor_type, vae, dm, save_dir)
         
-        real_windows, real_user_ids = load_windows_from_data(dm, sensor_type)
-        
-        synth_df = sample_synthetic(len(real_windows), ddpm, vae, dm)
-        
-        synth_windows = []
-        synth_user_ids = []
-        
-        
-        unique_real_user_ids = np.unique(real_user_ids)
-        
-        for user_id in unique_real_user_ids[:20]:
-            user_id_str = str(user_id)
-            user_synth = synth_df[synth_df["__user_id__"] == user_id_str]
-            
-            if len(user_synth) >= WINDOW_SIZE:
-                user_data = user_synth[["Xvalue", "Yvalue", "Zvalue"]].values
-                for i in range(0, len(user_data) - WINDOW_SIZE + 1, WINDOW_SIZE):
-                    synth_windows.append(user_data[i:i+WINDOW_SIZE])
-                    synth_user_ids.append(user_id)
-        
-        if len(synth_windows) < len(real_windows) and len(synth_df) >= WINDOW_SIZE:
-            print(f"Warning: Only found {len(synth_windows)} matching synthetic windows, using all available synthetic data")
-            all_synth_data = synth_df[["Xvalue", "Yvalue", "Zvalue"]].values
-            for i in range(0, len(all_synth_data) - WINDOW_SIZE + 1, WINDOW_SIZE):
-                if len(synth_windows) >= len(real_windows):
-                    break
-                synth_windows.append(all_synth_data[i:i+WINDOW_SIZE])
-                
-                synth_user_id = synth_df.iloc[i]["__user_id__"]
-                try:
-                    synth_user_ids.append(int(synth_user_id) if synth_user_id.isdigit() else synth_user_id)
-                except:
-                    synth_user_ids.append(synth_user_id)
-        
-        synth_windows = np.array(synth_windows[:len(real_windows)]) if len(synth_windows) > 0 else np.array([])
-        synth_user_ids = np.array(synth_user_ids[:len(real_windows)]) if len(synth_user_ids) > 0 else np.array([])
+        # Get matched samples for evaluation
+        real_windows, real_user_ids, synth_windows, synth_user_ids = get_matched_real_and_synth_windows(
+            sensor_type=sensor_type,
+            split="test",
+            per_user_k=per_user_k,
+            ddpm=ddpm,
+            vae=vae,
+            dm=dm,
+            eval_seed=eval_seed
+        )
         
         if not skip_eda:
-            run_eda_analysis(sensor_type, dm, save_dir, vae, ddpm, post_cfg=post_cfg, fs_hz=fs_hz)
+            run_eda_analysis(
+                sensor_type, dm, save_dir, vae, ddpm,
+                post_cfg=post_cfg, fs_hz=fs_hz,
+                per_user_k=per_user_k, eval_seed=eval_seed
+            )
         else:
             print(f"\n{'='*60}")
             print(f"Skipping EDA for {sensor_type} (skip_eda=True)")
             print(f"{'='*60}\n")
         
-        run_realism_evaluation(sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir, post_cfg=post_cfg, fs_hz=fs_hz)
-        run_augmentation_experiment_wrapper(sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids, save_dir, post_cfg=post_cfg, fs_hz=fs_hz)
+        run_realism_evaluation(
+            sensor_type, ddpm, vae, dm, save_dir,
+            post_cfg=post_cfg, fs_hz=fs_hz,
+            split_mode=split_mode,
+            per_user_k=per_user_k, eval_seed=eval_seed
+        )
+        
+        run_augmentation_experiment_wrapper(
+            sensor_type, real_windows, real_user_ids, synth_windows, synth_user_ids,
+            save_dir, post_cfg=post_cfg, fs_hz=fs_hz
+        )
         
         print(f"\n{'='*60}")
         print(f"Pipeline complete for {sensor_type}")
