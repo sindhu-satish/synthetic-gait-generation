@@ -167,11 +167,16 @@ def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, ep
     rms_pred = torch.sqrt((m_pred ** 2).mean(dim=1) + eps)  # (B,)
     rms_real = torch.sqrt((m_real ** 2).mean(dim=1) + eps)  # (B,)
     
-    # Compute global stats for fallback
+    # Get global fallback stats (stored in JSON or compute from user stats)
     cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
-    all_rms_mean = np.mean([user_stats[uid]["mean_rms_mag"] for uid in user_stats.keys()])
-    all_rms_std = np.std([user_stats[uid]["mean_rms_mag"] for uid in user_stats.keys()])
-    all_rms_std = max(all_rms_std, 1e-3)
+    if "__global__" in user_stats:
+        all_rms_mean = user_stats["__global__"]["mean_rms_mag"]
+        all_rms_std = max(user_stats["__global__"]["std_rms_mag"], 1e-3)
+    else:
+        # Fallback: compute from user means (backward compatibility)
+        user_uids = [uid for uid in user_stats.keys() if uid != "__global__"]
+        all_rms_mean = np.mean([user_stats[uid]["mean_rms_mag"] for uid in user_uids])
+        all_rms_std = max(np.std([user_stats[uid]["mean_rms_mag"] for uid in user_uids]), 1e-3)
     
     # Standardize using user-specific stats
     z_rms_pred = []
@@ -180,7 +185,7 @@ def compute_rms_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats, ep
     
     for i, uid in enumerate(cond_np):
         uid_int = int(uid)
-        if uid_int in user_stats:
+        if uid_int in user_stats and uid_int != "__global__":
             mu = user_stats[uid_int]["mean_rms_mag"]
             sigma = max(user_stats[uid_int]["std_rms_mag"], 1e-3)
         else:
@@ -216,11 +221,16 @@ def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats,
     e_pred = (m_pred ** 2).mean(dim=1)  # (B,)
     e_real = (m_real ** 2).mean(dim=1)  # (B,)
     
-    # Compute global stats for fallback
+    # Get global fallback stats (stored in JSON or compute from user stats)
     cond_np = cond.cpu().numpy() if isinstance(cond, torch.Tensor) else cond
-    all_e_mean = np.mean([user_stats[uid]["mean_energy_mag"] for uid in user_stats.keys()])
-    all_e_std = np.std([user_stats[uid]["mean_energy_mag"] for uid in user_stats.keys()])
-    all_e_std = max(all_e_std, 1e-3)
+    if "__global__" in user_stats:
+        all_e_mean = user_stats["__global__"]["mean_energy_mag"]
+        all_e_std = max(user_stats["__global__"]["std_energy_mag"], 1e-3)
+    else:
+        # Fallback: compute from user means (backward compatibility)
+        user_uids = [uid for uid in user_stats.keys() if uid != "__global__"]
+        all_e_mean = np.mean([user_stats[uid]["mean_energy_mag"] for uid in user_uids])
+        all_e_std = max(np.std([user_stats[uid]["mean_energy_mag"] for uid in user_uids]), 1e-3)
     
     # Standardize using user-specific stats
     z_e_pred = []
@@ -228,7 +238,7 @@ def compute_energy_user_loss(x0_pred_windows, x0_real_windows, cond, user_stats,
     
     for i, uid in enumerate(cond_np):
         uid_int = int(uid)
-        if uid_int in user_stats:
+        if uid_int in user_stats and uid_int != "__global__":
             mu = user_stats[uid_int]["mean_energy_mag"]
             sigma = max(user_stats[uid_int]["std_energy_mag"], 1e-3)
         else:
@@ -426,6 +436,9 @@ def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir
     
     # Compute mean and std per user
     user_stats = {}
+    all_rms = []
+    all_energy = []
+    
     for uid in user_rms.keys():
         rms_list = user_rms[uid]
         energy_list = user_energy[uid]
@@ -435,6 +448,16 @@ def compute_user_magnitude_stats(dm: GaitDataModule, sensor_type: str, cache_dir
             "mean_energy_mag": float(np.mean(energy_list)),
             "std_energy_mag": float(np.std(energy_list))
         }
+        all_rms.extend(rms_list)
+        all_energy.extend(energy_list)
+    
+    # Compute and store global fallback stats
+    user_stats["__global__"] = {
+        "mean_rms_mag": float(np.mean(all_rms)),
+        "std_rms_mag": float(np.std(all_rms)),
+        "mean_energy_mag": float(np.mean(all_energy)),
+        "std_energy_mag": float(np.std(all_energy))
+    }
     
     # Save cache
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
